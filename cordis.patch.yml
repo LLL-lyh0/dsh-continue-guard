@@ -1,0 +1,42 @@
+# 一键「继续」插件（Continue button）
+#
+# 输入栏下方（composer 停靠区）加一颗「继续」按钮：意外中断的会话点一下就重新跑起来；
+# 同时监听网络中断 / 上游截断（输出超限、断流），恢复后等 1~3 秒自动补发一次「继续」。
+#
+# Host 半身持有唯一的中断判定与续跑预算，Client 半身只渲染按钮并调用同一组路由。
+# 下面每一项都可改；字段语义见 index.js 的 DEFAULTS 与 Config。
+- insert:
+    - id: dsh-continue-guard
+      name: 'dsh-continue-guard'
+      config:
+        enabled: true
+        # 按钮与自动续跑发送的文本。
+        text: 继续
+        # 自动续跑总开关。关掉后只剩手动按钮。
+        autoResume: true
+        # 网络恢复后到发出「继续」的等待（毫秒），建议 1000~3000。
+        resumeDelayMs: 2000
+        # 同一会话连续自动续跑的次数上限；人一说话就清零。
+        maxAutoResumes: 3
+        # 普通模型/代理错误是否也自动续跑。
+        # 默认否：AUTH、额度耗尽与断网在本地无法区分，自动重试会白烧额度。
+        autoResumeOnError: false
+        # 输出在 max-tokens 处被截断时自动续跑（这类截断重试是安全的）。
+        resumeOnTruncation: true
+        # 连通性探测目标，按顺序尝试。换成你自己的网关更可靠：
+        # 有些环境会拦这些域名，探测失败会被当成「还没联网」。
+        probeUrls:
+          - https://api.deepseek.com
+          - https://www.baidu.com
+          - https://github.com
+        probeTimeoutMs: 4000
+        probeRetries: 5
+        probeBackoffMs: 3000
+        probeBackoffMaxMs: 30000
+        # 同一会话两次自动续跑之间的最小间隔（毫秒）。
+        minResumeGapMs: 4000
+        # 按钮外观：是否画胶囊底/描边；是否把中断原因写进 hover 提示。
+        pill: true
+        showReason: true
+        # 排查「为什么没自动继续」时打开：每次判定与续跑都写进宿主日志。
+        verbose: false

@@ -1,0 +1,23 @@
+{
+  "meta": {
+    "title": "Continue button",
+    "description": "Adds a「继续」button under the composer: one click re-runs a session that stopped unexpectedly, and a network drop or an upstream cut (output limit) resumes itself 1–3 s after the link recovers."
+  },
+  "button": {
+    "resume": "Continue",
+    "resuming": "Sending…",
+    "sent": "Sent — the task is running again",
+    "armed": "Back online — auto-resume in {seconds}s…",
+    "waitingNetwork": "Waiting for the network to come back…",
+    "probing": "Checking the connection…",
+    "budget": "Auto-resume limit reached",
+    "failed": "Send failed",
+    "noAgent": "No live agent for this session; open it and try again",
+    "offline": "offline"
+  },
+  "tip": {
+    "default": "Re-runs a session that stopped unexpectedly. After a network drop or an upstream cut (output limit) it clicks itself once the link is back.",
+    "offline": "Offline — it will resume automatically when the link returns.",
+    "idle": "No interruption detected. Clicking still sends a「继续」."
+  }
+}

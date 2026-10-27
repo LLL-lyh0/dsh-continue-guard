@@ -1,0 +1,69 @@
+{
+  "name": "dsh-continue-guard",
+  "version": "0.1.0",
+  "description": "一键「继续」：在输入栏提供一键续跑意外中断的会话；检测网络中断 / 上游截断（输出超限），恢复后 1~3 秒自动续跑。One-click continue for interrupted sessions, with automatic resume after a network drop or an upstream cut.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "dsh-bundle",
+    "cordis",
+    "continue",
+    "auto-resume",
+    "network"
+  ],
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "LICENSE",
+    "scripts/*.mjs",
+    "docs/store/*"
+  ],
+  "scripts": {
+    "test": "node scripts/verify-host.mjs && node scripts/verify-client.mjs && node scripts/verify-bundle.mjs && node scripts/verify-mount.mjs && node scripts/check-readme-counts.mjs",
+    "test:host": "node scripts/verify-host.mjs",
+    "test:client": "node scripts/verify-client.mjs",
+    "test:bundle": "node scripts/verify-bundle.mjs",
+    "test:mount": "node scripts/verify-mount.mjs",
+    "test:docs": "node scripts/check-readme-counts.mjs",
+    "test:mutation": "node scripts/mutate-client.mjs"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-conversation"
+      ]
+    }
+  },
+  "author": "LLL-lyh0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LLL-lyh0/dsh-continue-guard.git"
+  },
+  "homepage": "https://github.com/LLL-lyh0/dsh-continue-guard#readme",
+  "peerDependencies": {
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1 <0.1.0 || >=0.1.0-rc.1 <0.1.2-alpha.1 || >=0.1.2-alpha.1 <0.2.0-0 || >=0.2.0-rc.1 <0.2.1-alpha.1 || >=0.2.1-alpha.1 <0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-llm": {
+      "optional": true
+    }
+  }
+}
