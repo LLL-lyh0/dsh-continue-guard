@@ -1,7 +1,7 @@
 {
   "name": "dsh-continue-guard",
-  "version": "0.1.0",
-  "description": "一键「继续」：在输入栏提供一键续跑意外中断的会话；检测网络中断 / 上游截断（输出超限），恢复后 1~3 秒自动续跑。One-click continue for interrupted sessions, with automatic resume after a network drop or an upstream cut.",
+  "version": "0.2.0",
+  "description": "一键「继续」：在输入栏提供一键续跑意外中断的会话；检测网络中断 / 上游截断（输出超限），恢复后 1~3 秒自动续跑；宿主重启后还能接上被进程退出打断、没跑完的回合。One-click continue for interrupted sessions, automatic resume after a network drop or an upstream cut, and startup recovery for turns a process exit left unfinished.",
   "type": "module",
   "license": "MIT",
   "keywords": [

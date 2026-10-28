@@ -33,6 +33,25 @@ Host 侧另有一条兜底通路（`POST /resume`，署名 `plugin:dsh-continue-
 
 **发送前的三重护栏**：Agent 必须 `idle`（运行中投 followup 会烂在收件箱里）、收件箱必须空着、同一会话两次自动续跑之间还有最小间隔。连续自动续跑有次数上限；**人一说话就清零**——包括次数和间隔，因为人接手过之后，下一次失败是新的一轮。
 
+### 4. 宿主重启后自动接上没跑完的会话
+
+前三条都要求**会话还活着**（有 agent、有内存里的中断状态）。但如果 DSH 自己被关掉、崩掉、或被杀掉，那个「正在跑」的回合就**什么都没有了**：没有 agent，没有事件，内存状态也随进程一起消失。唯一的证据留在会话日志里——**一个开着却没关上的回合**（`turn/start` 之后没有 `turn/end`），正说明进程是在跑这一轮的时候没的。宿主自己修日志时用的也是这个判据（`dsh-session` 的 `interruptedTurnClosers`）。
+
+所以启动时会做一次扫描：
+
+- 只看**最近 24 小时**内有活动的会话（`startupResumeWithinMs`），按最后活动时间**从新到旧**；
+- 最多接上 `startupResumeLimit`（默认 3）个，不会一次唤醒一堆；
+- 结尾的判定**只认日志**，而且下面这些形状是在 **467 份真实日志**里数出来的，不是猜的：
+  - 回合没关（`turn/start` 之后没有 `turn/end`）→ 进程中途退出 → 接；
+  - `{"kind":"error"}` 且错误是传输类（TRANSPORT / TIMEOUT / SERVER / fetch failed…）→ 当成断网 → **等网络探测通过**再接；
+  - `{"kind":"max-tokens"}` → 输出被截断 → 按 `resumeOnTruncation` 接；
+  - `{"kind":"aborted","reason":{"kind":"user"}}` → **人按过停止** → 永不接（这是明确要求）；
+  - `{"kind":"aborted","reason":{"kind":"parent"|"disposed"}}` → 父会话结束 / 会话被拆掉，都是有意的 → 不接；
+  - `completed` → 没事，不接；
+  - 上下文超窗（`CONTEXT_WINDOW_EXCEEDED`）→ 永不接（要先压缩，否则只是再溢出一次）。
+- 判定为中断的会话会先**按老规矩种一个 episode**（复用同一套预算、探测、最小间隔、防连点），再在没有活 agent 时用 `agents.resume({ resumeSessionId })` 唤醒它——这也是宿主自己的崩溃恢复入口，它会顺手把那个没关上的回合补上结尾。
+- **不抢别人的活**：会话已经有 agent 且在跑就跳过（界面可能已经先打开了它）。唤醒失败也不影响别的：episode 已经种下，手动打开那个会话照样会续。
+
 ---
 
 ## 安装
@@ -93,10 +112,10 @@ dsh plugin add link:./dsh-continue-guard
 
 ## 验证
 
-四道门禁，全部离线可跑，`npm test` 一次跑完（100 项）：
+四道门禁，全部离线可跑，`npm test` 一次跑完（117 项）：
 
 ```bash
-node scripts/verify-host.mjs    # 31 项决策规则（虚拟时钟 + 假 agent）
+node scripts/verify-host.mjs    # 48 项决策规则 + 启动恢复（虚拟时钟 + 假 agent）
 node scripts/verify-client.mjs  # 22 项按钮状态机（VM + React 桩 + 假宿主）
 node scripts/verify-bundle.mjs  # 28 项静态接线检查
 node scripts/verify-mount.mjs   # 19 项挂载与端到端投递（假 ctx + 真路由）
@@ -123,7 +142,7 @@ cordis.patch.yml    插入插件行 + 全部可调参数
 locale/{zh,en}.json Plugin Manager 显示的标题与描述
 icon.svg            原创图标（断开的环 + 播放楔形）
 scripts/
-  verify-host.mjs       31 项：中断判定与续跑预算（虚拟时钟 + 假 agent）
+  verify-host.mjs       48 项：中断判定、续跑预算、启动恢复（虚拟时钟 + 假 session 日志）
   verify-client.mjs     22 项：按钮状态机（VM + React 桩 + 假宿主）
   verify-bundle.mjs     28 项：静态接线 / 注入形状 / 署名红线
   verify-mount.mjs      19 项：挂载与端到端投递（假 ctx + 真路由）

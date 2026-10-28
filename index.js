@@ -49,6 +49,13 @@
 import { createRequire } from 'node:module';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
+// Startup recovery reads the on-disk session log. `node:fs` + `node:zlib` are
+// builtins, so they respect the rule above; the log is zstd-compressed in
+// appended frames, and `zstdDecompressSync` is the only decoder available here.
+import { readFileSync, readdirSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { zstdDecompressSync } from 'node:zlib';
 
 const NS = 'dsh-continue-guard';
 const ROUTE_BASE = '/api/dsh-continue-guard';
@@ -77,6 +84,13 @@ const RESUME_NOTE = Object.freeze({
   'upstream.truncated': '上一轮的回复在输出上限处被截断，任务没有做完。请接着被截断的地方继续完成。',
   'upstream.context-window': '上一轮超出了模型的上下文窗口。请压缩后接着完成未做完的部分。',
   'upstream.aborted': '上一轮提前中断，没有给出结论。请接着完成。',
+  /**
+   * Only the startup scan produces this one. The log's tail turn was never
+   * closed, which means the process died while the turn was still running — the
+   * harness names the same condition `interrupted` when it appends its own
+   * crash-recovery closers (`interruptedTurnClosers` in dsh-session).
+   */
+  'process.exit': '上一个进程在任务跑到一半时退出了，这一轮没有跑完。请接着把它做完。',
   error: '上一轮出了错误。请判断错误是否已经消除，然后接着完成。',
 });
 
@@ -114,6 +128,16 @@ export const DEFAULTS = Object.freeze({
   /** Append the interruption reason to the button's hover title. */
   showReason: true,
   verbose: false,
+  /**
+   * Startup recovery: after the host restarts, a session that was killed
+   * mid-turn has no live agent and no in-memory episode, so nothing would ever
+   * notice it. The scan rebuilds that episode from the session log on disk.
+   */
+  startupResume: true,
+  /** How far back the scan looks. A day matches "最近、意外中断" without resurrecting stale work. */
+  startupResumeWithinMs: 24 * 60 * 60 * 1000,
+  /** Most sessions to wake at once. One crash usually leaves one or two. */
+  startupResumeLimit: 3,
 });
 
 /** Non-empty string, else the default. */
@@ -163,6 +187,9 @@ export function normalizeConfig(raw) {
     pill: flag(value.pill, DEFAULTS.pill),
     showReason: flag(value.showReason, DEFAULTS.showReason),
     verbose: flag(value.verbose, DEFAULTS.verbose),
+    startupResume: flag(value.startupResume, DEFAULTS.startupResume),
+    startupResumeWithinMs: num(value.startupResumeWithinMs, DEFAULTS.startupResumeWithinMs, 60000, 30 * 24 * 60 * 60 * 1000),
+    startupResumeLimit: Math.round(num(value.startupResumeLimit, DEFAULTS.startupResumeLimit, 0, 20)),
   };
 }
 
@@ -198,6 +225,9 @@ export const Config = {
     pill: { type: 'boolean', default: DEFAULTS.pill, description: '是否给按钮画胶囊底/描边；关掉就是一颗朴素按钮。' },
     showReason: { type: 'boolean', default: DEFAULTS.showReason, description: '中断原因写进按钮提示文案（hover 标题）里。' },
     verbose: { type: 'boolean', default: DEFAULTS.verbose, description: '把每次判定与续跑写进宿主日志，排查“为什么没自动继续”时打开。' },
+    startupResume: { type: 'boolean', default: DEFAULTS.startupResume, description: '宿主重启后，扫描最近的会话日志，把「进程中途退出」而没跑完的会话自动接上。' },
+    startupResumeWithinMs: { type: 'number', default: DEFAULTS.startupResumeWithinMs, description: '启动扫描往前看多久（毫秒，默认 24 小时）。' },
+    startupResumeLimit: { type: 'number', default: DEFAULTS.startupResumeLimit, description: '一次启动最多自动接上几个会话（按最后活动时间从新到旧）。' },
   },
 };
 
@@ -224,10 +254,26 @@ export function classifyInterrupt(event) {
     // `completed` is a normal end; `cancelled`/`stop` is a human pressing stop,
     // and a running `goal` end is the driver's own business. None are ours.
     if (kind === undefined || kind === 'completed' || kind === 'cancelled' || kind === 'stop') return null;
+    // WHO ended the turn decides whether it is ours to retry. The observed shapes
+    // are `{"kind":"aborted","reason":{"kind":"user"}}` (a person pressed stop),
+    // `...{"kind":"parent"}` (the driving parent went away) and
+    // `...{"kind":"disposed"}` (the agent was torn down — a session was closed).
+    // All three are deliberate, so none is a failure to retry: resuming them
+    // would fight the human, and with `autoResumeOnError: true` it would fight
+    // them on every single stop.
+    const by = typeof reason?.reason?.kind === 'string' ? reason.reason.kind : undefined;
+    if (kind === 'aborted' && (by === 'user' || by === 'parent' || by === 'disposed')) return null;
     if (kind === 'error') {
       const code = errorCodeOf(reason?.error ?? data.error ?? data.message?.error);
       return code === 'CONTEXT_WINDOW_EXCEEDED' ? 'upstream.context-window' : 'error';
     }
+    // A length stop reaches this branch too — the harness records
+    // `{"kind":"max-tokens"}` as a *turn/end* reason, not only as an
+    // `assistant/message` finish chunk. Falling through to `upstream.aborted`
+    // asked for `autoResumeOnError`, so with the default settings a truncated
+    // turn never auto-resumed even though `resumeOnTruncation` was on: the
+    // setting silently did nothing.
+    if (kind === 'max-tokens' || kind === 'length') return 'upstream.truncated';
     return 'upstream.aborted';
   }
 
@@ -518,6 +564,280 @@ export function probeBudgetMs(config) {
  *    that comes back emits no event anywhere — parking on a "recovered" edge
  *    would wait forever.
  */
+// ── startup recovery: rebuild a lost episode from the session log ────────────
+//
+// Why this exists: every other resume path in this plugin needs a live agent.
+// When the process dies mid-turn there is no agent, no in-memory episode and no
+// event — so after a restart nothing would ever notice the unfinished work. The
+// only surviving evidence is the session log on disk, and the only reliable
+// signature is a turn that was never closed. (The harness reaches the same
+// conclusion from `interruptedTurnClosers` in dsh-session, which appends
+// synthetic `interrupted` closers when `agents.resume` reopens such a log.)
+
+/** zstd frame magic. Logs are appended as whole frames, so the newest events are in the LAST frames. */
+const ZSTD_MAGIC = Buffer.from([0x28, 0xb5, 0x2f, 0xfd]);
+/** Log file names, newest format first — the same list dsh-archived-digest reads. */
+export const SESSION_LOG_NAMES = Object.freeze(['session.jsonl.zstd', 'session.v4.jsonl.zstd']);
+
+/** Every offset where a zstd frame could start. */
+function magicOffsets(buf) {
+  const offsets = [];
+  let at = buf.indexOf(ZSTD_MAGIC, 0);
+  while (at !== -1) {
+    offsets.push(at);
+    at = buf.indexOf(ZSTD_MAGIC, at + 4);
+  }
+  return offsets;
+}
+
+/**
+ * Decode the tail of a multi-frame zstd session log.
+ *
+ * Reading backwards from the newest frame is what keeps this cheap: a 3 MB log
+ * is thousands of frames, but the answer usually sits in the last one or two.
+ * Decoding stops at the first turn boundary, because that boundary is the
+ * question being asked — anything older cannot change the verdict.
+ *
+ * A magic-byte match inside a compressed payload is a false positive, so each
+ * slice is decoded and validated, widening the window on failure. A bad slice
+ * must never swallow the boundary that precedes a real frame.
+ *
+ * @returns raw JSONL text of the tail, or '' when unreadable.
+ */
+export function decodeZstdTail(buf, options = {}) {
+  const minLines = Number.isFinite(options.minLines) ? options.minLines : 4;
+  const maxFrames = Number.isFinite(options.maxFrames) ? options.maxFrames : 64;
+  if (!Buffer.isBuffer(buf) || buf.length === 0) return '';
+  if (buf.indexOf(ZSTD_MAGIC) === -1) return '';
+  const offsets = magicOffsets(buf);
+  const parts = [];
+  let lines = 0;
+  let frames = 0;
+  for (let i = offsets.length - 1; i >= 0 && frames < maxFrames; i -= 1) {
+    const start = offsets[i];
+    let decoded = null;
+    for (let j = i + 1; j <= offsets.length; j += 1) {
+      const stop = j < offsets.length ? offsets[j] : buf.length;
+      if (stop <= start) continue;
+      try {
+        decoded = zstdDecompressSync(buf.subarray(start, stop)).toString('utf8');
+        break;
+      } catch {
+        /* false positive or truncated frame: widen the window */
+      }
+    }
+    if (decoded === null) break;
+    parts.unshift(decoded);
+    frames += 1;
+    lines += decoded.split('\n').filter((line) => line.trim() !== '').length;
+    if (lines < minLines) continue;
+    const accumulated = parts.join('');
+    if (accumulated.includes('"turn/start"') || accumulated.includes('"turn/end"')) break;
+  }
+  return parts.join('');
+}
+
+/** Read + decode one session log's tail. Never throws: recovery must not break boot. */
+export function readSessionLogTail(file, options = {}) {
+  try {
+    return decodeZstdTail(readFileSync(file), options);
+  } catch {
+    return '';
+  }
+}
+
+/** Parse JSONL defensively: a bad line is skipped, never fatal. */
+export function parseLogLines(text) {
+  const events = [];
+  for (const line of String(text ?? '').split('\n')) {
+    const trimmed = line.trim();
+    if (trimmed === '') continue;
+    try {
+      const parsed = JSON.parse(trimmed);
+      if (parsed !== null && typeof parsed === 'object') events.push(parsed);
+    } catch {
+      /* a torn final line is expected on a crashed writer */
+    }
+  }
+  return events;
+}
+
+/** Where sessions live: `$DSH_HOME`, else `~/.dsh`. */
+export function resolveSessionHome(env = process.env) {
+  const fromEnv = env !== null && env !== undefined && typeof env.DSH_HOME === 'string' ? env.DSH_HOME.trim() : '';
+  if (fromEnv !== '') return fromEnv;
+  try {
+    return join(homedir(), '.dsh');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Session logs touched inside the window, newest first.
+ *
+ * Sorted by last activity because the caller caps how many it will wake, and the
+ * most recently interrupted session is the one the person is waiting on.
+ */
+export function listRecentSessionLogs(home, options = {}) {
+  const withinMs = Number.isFinite(options.withinMs) ? options.withinMs : DEFAULTS.startupResumeWithinMs;
+  const now = Number.isFinite(options.now) ? options.now : Date.now();
+  const found = [];
+  if (typeof home !== 'string' || home === '') return found;
+  let projects;
+  try {
+    projects = readdirSync(join(home, 'sessions'), { withFileTypes: true });
+  } catch {
+    return found;
+  }
+  for (const project of projects) {
+    if (!project.isDirectory()) continue;
+    const projectDir = join(home, 'sessions', project.name);
+    let sessions;
+    try {
+      sessions = readdirSync(projectDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const session of sessions) {
+      if (!session.isDirectory()) continue;
+      const dir = join(projectDir, session.name);
+      // The names are alternatives for one log, so the first that exists wins.
+      let hit = null;
+      for (const name of SESSION_LOG_NAMES) {
+        try {
+          const stat = statSync(join(dir, name));
+          if (stat.isFile()) {
+            hit = { file: join(dir, name), mtimeMs: stat.mtimeMs };
+            break;
+          }
+        } catch {
+          /* try the next name */
+        }
+      }
+      if (hit === null) continue;
+      if (now - hit.mtimeMs > withinMs) continue;
+      found.push({ sessionId: session.name, project: project.name, ...hit });
+    }
+  }
+  return found.sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+/**
+ * Decide whether one session's log ended in an interruption worth resuming.
+ *
+ * Pure, so the whole rule set is testable without a filesystem or a host.
+ * `null` means "leave it alone": a completed turn, a turn a person stopped, a
+ * deliberate teardown, or a log that never ran a turn.
+ *
+ * @returns `{ reason, event }` where `reason` is a classifyInterrupt code, or
+ *   `'process.exit'` for an unclosed turn.
+ */
+export function classifyRecovery(events) {
+  if (!Array.isArray(events) || events.length === 0) return null;
+  let lastStart = -1;
+  let lastEnd = -1;
+  for (let i = 0; i < events.length; i += 1) {
+    const type = events[i]?.type;
+    if (type === 'turn/start') lastStart = i;
+    else if (type === 'turn/end') lastEnd = i;
+  }
+  // A turn that opened and never closed is the signature of a process that died
+  // while it was still running. This is exactly the condition the harness calls
+  // `interrupted` when it repairs the log on resume.
+  if (lastStart > lastEnd) return { reason: 'process.exit', event: events[lastStart] };
+  if (lastEnd === -1) return null;
+  const reason = classifyInterrupt(events[lastEnd]);
+  if (reason === null) return null;
+  // A transport failure is the case this scan exists for: "the session died
+  // because the link died" has to resume once the link is back, with no extra
+  // opt-in. classifyInterrupt reports a generic `error` for every failure
+  // because the LIVE path must stay conservative — there, an unclassified error
+  // may be an exhausted quota, and retrying that burns money. The log carries
+  // the raw error, so a wire failure can be told apart from a refusal and mapped
+  // onto the probe-gated `network.down`, which waits for the link instead of
+  // firing blind.
+  if (reason === 'error') {
+    const raw = events[lastEnd]?.data;
+    const record = errorRecordOf(raw?.reason?.error ?? raw?.error ?? raw?.message?.error);
+    if (isTransportError(record)) return { reason: 'network.down', event: events[lastEnd] };
+  }
+  return { reason, event: events[lastEnd] };
+}
+
+/**
+ * Run the startup scan and feed each interrupted session into the scheduler.
+ *
+ * Every dependency is injectable so the whole path is testable: `listLogs`,
+ * `readTail`, `resolveAgent` and `wake` are replaced in tests, and the real ones
+ * read the disk and call `agents.resume`.
+ *
+ * @returns a summary of what was seen and done, for the log line and the tests.
+ */
+export async function recoverInterruptedSessions(deps = {}) {
+  const config = deps.config ?? DEFAULTS;
+  const core = deps.core;
+  const log = deps.log;
+  const now = typeof deps.now === 'function' ? deps.now : Date.now;
+  const listLogs = deps.listLogs ?? listRecentSessionLogs;
+  const readTail = deps.readTail ?? readSessionLogTail;
+  const resolveAgent = deps.resolveAgent ?? (() => undefined);
+  const wake = deps.wake;
+  const summary = { scanned: 0, resumed: 0, woken: 0, skipped: [] };
+  if (core === undefined || core === null) return summary;
+  // Startup recovery is an automatic resume, so it obeys the auto-resume switch.
+  if (config.startupResume !== true || config.autoResume !== true) return summary;
+  const home = deps.home !== undefined ? deps.home : resolveSessionHome(deps.env);
+  if (typeof home !== 'string' || home === '') {
+    summary.skipped.push('no-home');
+    return summary;
+  }
+  const limit = Math.max(0, Number(config.startupResumeLimit) || 0);
+  const logs = listLogs(home, { withinMs: config.startupResumeWithinMs, now: now() });
+  summary.scanned = logs.length;
+  for (const entry of logs) {
+    if (summary.resumed >= limit) break;
+    const agent = resolveAgent(entry.sessionId);
+    // Someone is already driving this session — the GUI may have reopened it
+    // first, and racing that would start a second turn in the same log.
+    if (agent !== undefined && agent !== null && String(agent.status ?? '').toLowerCase() === 'running') {
+      summary.skipped.push(entry.sessionId);
+      continue;
+    }
+    let verdict = null;
+    try {
+      verdict = classifyRecovery(parseLogLines(readTail(entry.file, { minLines: 4 })));
+    } catch {
+      verdict = null;
+    }
+    if (verdict === null) continue;
+    summary.resumed += 1;
+    // Seed the episode BEFORE waking: the delay, budget, probe and gap rules are
+    // already implemented there, so recovery reuses them instead of inventing a
+    // second, subtly different send path.
+    core.observeInterrupt(entry.sessionId, verdict.reason, {
+      recovered: true,
+      fromLog: entry.project,
+      at: entry.mtimeMs,
+    }, undefined);
+    if (log !== undefined && (config.verbose === true || verdict.reason === 'process.exit')) {
+      log.info(`${NS}: 启动恢复 ${entry.sessionId}（${verdict.reason}，最后活动 ${new Date(entry.mtimeMs).toISOString()}）`);
+    }
+    if (agent !== undefined && agent !== null) continue;
+    if (typeof wake !== 'function') continue;
+    try {
+      await wake(entry.sessionId);
+      summary.woken += 1;
+    } catch (error) {
+      // A session that cannot be reopened still keeps its seeded episode, so
+      // opening it by hand later still resumes it.
+      summary.skipped.push(entry.sessionId);
+      if (log !== undefined) log.info(`${NS}: 无法唤醒 ${entry.sessionId}：${error?.message ?? error}`);
+    }
+  }
+  return summary;
+}
+
 export class LoopResumeScheduler {
   constructor(options) {
     this.config = options.config;
@@ -701,6 +1021,10 @@ export class LoopResumeScheduler {
     if (reason === 'upstream.truncated') return this.config.resumeOnTruncation;
     if (reason === 'error') return this.config.autoResumeOnError;
     if (reason === 'upstream.aborted') return this.config.autoResumeOnError;
+    // Produced only by the startup scan, so `startupResume` is its own switch:
+    // someone who wants crash recovery but not error-retry storms gets exactly
+    // that, with no extra knob.
+    if (reason === 'process.exit') return this.config.startupResume;
     return false;
   }
 
@@ -1311,6 +1635,50 @@ export function apply(ctx, config) {
       if (id === undefined) return;
       created.observeInput(id, message);
     });
+
+    /**
+     * Startup recovery, once, after the index is seeded and the listeners are
+     * attached — so a seeded episode immediately has the idle/status edges it
+     * needs to fire. Deferred as a microtask-free async IIFE because `apply()`
+     * must return promptly.
+     */
+    scope.effect(() => {
+      let cancelled = false;
+      void (async () => {
+        try {
+          const summary = await recoverInterruptedSessions({
+            config: resolved,
+            core: created,
+            log: ctx.logger,
+            resolveAgent: (sessionId) => index.get(sessionId),
+            wake: async (sessionId) => {
+              // The supported crash-recovery path: it repairs the interrupted
+              // turn (its own `interruptedTurnClosers`) and publishes an agent
+              // for an otherwise dormant session. Throws when the id is already
+              // owned, which is exactly the race we want to lose quietly.
+              if (typeof scope.agents?.resume !== 'function') throw new Error('agents.resume 不可用');
+              await scope.agents.resume(scope, { resumeSessionId: sessionId });
+              // The published agent may already be idle, in which case no status
+              // edge will arrive to arm the delay.
+              created.observeIdle(sessionId);
+            },
+          });
+          if (cancelled) return;
+          if (resolved.verbose || summary.resumed > 0) {
+            ctx.logger.info(
+              `${NS}: 启动扫描完成（查看 ${summary.scanned} 个会话，判定中断 ${summary.resumed}，唤醒 ${summary.woken}）`,
+            );
+          }
+        } catch (error) {
+          // Recovery is a convenience: a failure here must never take the
+          // plugin (or the boot) down with it.
+          ctx.logger.info(`${NS}: 启动扫描失败：${error?.message ?? error}`);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }, `${NS}: startup recovery`);
 
     ctx.logger.info(
       `${NS}: 续跑核心已挂载（自动续跑 ${resolved.autoResume ? '开' : '关'}，延时 ${resolved.resumeDelayMs}ms，上限 ${resolved.maxAutoResumes} 次，探测 ${resolved.probeUrls.length} 个目标）`,

@@ -9,9 +9,15 @@
  * Run: node scripts/verify-host.mjs
  */
 import assert from 'node:assert/strict';
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { zstdCompressSync } from 'node:zlib';
 import {
-  LoopResumeScheduler, classifyInterrupt, composeResumeText, isTransportError,
-  normalizeConfig, probeOnce, stopReasonOf,
+  LoopResumeScheduler, SESSION_LOG_NAMES, classifyInterrupt, classifyRecovery,
+  composeResumeText, decodeZstdTail, isTransportError, listRecentSessionLogs,
+  normalizeConfig, parseLogLines, probeOnce, readSessionLogTail, recoverInterruptedSessions,
+  resolveSessionHome, stopReasonOf,
 } from '../index.js';
 
 let passed = 0;
@@ -113,6 +119,26 @@ check('a context-window failure is its own code (never auto-resumed)', () => {
   );
 });
 
+check('a deliberate abort is not an interruption, whoever caused it', () => {
+  // Shapes taken from 467 real session logs: a person pressing stop, a driving
+  // parent going away, and a session teardown. All three are decisions, not
+  // failures. Retrying them fights the human — and with `autoResumeOnError: true`
+  // the old code did that on every single stop, because all three arrived as a
+  // plain `aborted` and were classified `upstream.aborted`.
+  for (const by of ['user', 'parent', 'disposed']) {
+    assert.equal(
+      classifyInterrupt({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: by } } } }),
+      null,
+      `an abort by "${by}" must not be treated as a failure`,
+    );
+  }
+  // An abort with no attributable cause stays retryable under autoResumeOnError.
+  assert.equal(
+    classifyInterrupt({ type: 'turn/end', data: { reason: { kind: 'aborted' } } }),
+    'upstream.aborted',
+  );
+});
+
 check('a length stop is upstream.truncated', () => {
   const event = {
     type: 'assistant/message',
@@ -120,6 +146,17 @@ check('a length stop is upstream.truncated', () => {
   };
   assert.equal(classifyInterrupt(event), 'upstream.truncated');
   assert.equal(stopReasonOf(event), 'max-tokens');
+});
+
+check('the harness also records a length stop as a turn/end reason', () => {
+  // 24 of 467 real logs end on `{"kind":"max-tokens"}` at turn/end — not only as
+  // an `assistant/message` finish chunk. Treating it as a generic abort asked for
+  // `autoResumeOnError`, so with the defaults `resumeOnTruncation: true` silently
+  // did nothing for exactly the turns it was meant to cover.
+  assert.equal(
+    classifyInterrupt({ type: 'turn/end', data: { reason: { kind: 'max-tokens' } } }),
+    'upstream.truncated',
+  );
 });
 
 check('the raw adapter stopReason=length is also a truncation', () => {
@@ -215,6 +252,21 @@ await checkAsync('a plain error stays put unless autoResumeOnError is on', async
   await new Promise((resolve) => setImmediate(resolve));
   await fireArmed(on.clock, on.scheduler);
   assert.equal(on.sent.length, 1, 'fires when explicitly enabled');
+});
+
+await checkAsync('a human stop never auto-resumes, even with autoResumeOnError on', async () => {
+  // The live listener feeds whatever the classifier returns straight into
+  // observeInterrupt, so the classifier's verdict IS the decision. With
+  // autoResumeOnError on, the old code called `aborted/user` retryable and woke a
+  // session the person had deliberately stopped.
+  const { scheduler, clock, sent } = makeScheduler({ config: { autoResumeOnError: true } });
+  const verdict = classifyInterrupt({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } });
+  assert.equal(verdict, null, 'classifyInterrupt must refuse a human stop');
+  if (verdict !== null) scheduler.observeInterrupt('s1', verdict, null, 9);
+  await new Promise((resolve) => setImmediate(resolve));
+  clock.advance(60000);
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 0, 'nothing may be sent for a human stop');
 });
 
 await checkAsync('a failed probe does not resume, and the sweep retries it', async () => {
@@ -381,6 +433,215 @@ await checkAsync('probeOnce gives up after its retry budget', async () => {
   });
   assert.equal(result.ok, false);
   assert.equal(result.attempts, 2);
+});
+
+// ── startup recovery ────────────────────────────────────────────────────────
+//
+// The shapes below are not invented: they are the ones 467 real session logs on
+// this machine actually contain (collected before writing the classifier). That
+// is the point — a classifier written against imagined shapes silently resumes
+// sessions a person deliberately stopped.
+
+/** A session log is appended as whole zstd frames; build that exact shape. */
+function zstdFrames(chunks) {
+  return Buffer.concat(chunks.map((chunk) => zstdCompressSync(Buffer.from(chunk, 'utf8'))));
+}
+const logLine = (event) => `${JSON.stringify(event)}\n`;
+
+check('decodeZstdTail reads the newest frames and stops at the turn boundary', () => {
+  const older = logLine({ type: 'turn/start', seq: 1 }) + logLine({ type: 'step/start', seq: 2 });
+  const newest = logLine({ type: 'step/end', seq: 3 })
+    + logLine({ type: 'turn/end', seq: 4, data: { reason: { kind: 'completed' } } });
+  const buf = zstdFrames([older, newest]);
+
+  const brief = decodeZstdTail(buf, { minLines: 2 });
+  assert.ok(brief.includes('"turn/end"'), 'the boundary must be present');
+  assert.ok(!brief.includes('"seq":1'), 'frames older than the boundary are not decoded — that is what keeps this cheap');
+
+  const thorough = decodeZstdTail(buf, { minLines: 10 });
+  assert.ok(thorough.includes('"turn/start"'), 'a larger ask still walks back through more frames');
+
+  assert.equal(decodeZstdTail(Buffer.alloc(0)), '', 'an empty file is empty, not a throw');
+  assert.equal(decodeZstdTail(Buffer.from('not zstd at all', 'utf8')), '', 'a non-zstd file is empty, not a throw');
+});
+
+check('parseLogLines survives the torn final line a crashed writer leaves', () => {
+  const events = parseLogLines(`${logLine({ type: 'turn/start', seq: 1 })}{"type":"turn/e`);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].type, 'turn/start');
+  assert.deepEqual(parseLogLines(''), []);
+});
+
+check('resolveSessionHome prefers DSH_HOME and falls back to ~/.dsh', () => {
+  assert.equal(resolveSessionHome({ DSH_HOME: 'D:/custom-home' }), 'D:/custom-home');
+  assert.equal(resolveSessionHome({ DSH_HOME: '   ' }).endsWith(join('.dsh')), true);
+  assert.equal(resolveSessionHome({}).endsWith('.dsh'), true);
+});
+
+check('classifyRecovery agrees with the shapes real logs contain', () => {
+  const afterTurn = (reason) => classifyRecovery([
+    { type: 'turn/start' },
+    { type: 'turn/end', data: { reason } },
+  ]);
+  assert.equal(afterTurn({ kind: 'completed' }), null, 'a finished turn is not an interruption');
+  assert.equal(afterTurn({ kind: 'aborted', reason: { kind: 'user' } }), null, 'a person pressing stop must never be resurrected');
+  assert.equal(afterTurn({ kind: 'aborted', reason: { kind: 'parent' } }), null, 'a parent going away is not our failure');
+  assert.equal(afterTurn({ kind: 'aborted', reason: { kind: 'disposed' } }), null, 'a torn-down session was a decision too');
+  assert.equal(afterTurn({ kind: 'max-tokens' })?.reason, 'upstream.truncated');
+  assert.equal(afterTurn({ kind: 'error', error: { code: 'TRANSPORT', message: 'Connection error.' } })?.reason, 'network.down');
+  assert.equal(afterTurn({ kind: 'error', error: { code: 'RATE_LIMIT' } })?.reason, 'error');
+  assert.equal(afterTurn({ kind: 'error', error: { code: 'CONTEXT_WINDOW_EXCEEDED' } })?.reason, 'upstream.context-window');
+  assert.equal(afterTurn({ kind: 'error' })?.reason, 'error', 'an error with no record stays conservative');
+});
+
+check('an unclosed turn is read as a process exit', () => {
+  const verdict = classifyRecovery([{ type: 'turn/start' }, { type: 'step/start' }, { type: 'tool/call' }]);
+  assert.equal(verdict?.reason, 'process.exit');
+  assert.equal(classifyRecovery([{ type: 'user/message' }]), null, 'a log that never ran a turn has nothing to resume');
+  assert.equal(classifyRecovery([]), null);
+});
+
+check('listRecentSessionLogs keeps fresh logs, drops stale ones, newest first', () => {
+  const root = mkdtempSync(join(tmpdir(), 'dsh-guard-scan-'));
+  try {
+    const home = join(root, '.dsh');
+    const write = (project, session, name, ageMs) => {
+      const dir = join(home, 'sessions', project, session);
+      mkdirSync(dir, { recursive: true });
+      const file = join(dir, name);
+      writeFileSync(file, zstdFrames([logLine({ type: 'turn/start' })]));
+      if (ageMs > 0) {
+        const seconds = (Date.now() - ageMs) / 1000;
+        utimesSync(file, seconds, seconds);
+      }
+      return file;
+    };
+    const fresh = write('proj-a', 'session-fresh', SESSION_LOG_NAMES[0], 0);
+    write('proj-a', 'session-stale', SESSION_LOG_NAMES[0], 3 * 24 * 60 * 60 * 1000);
+    write('proj-b', 'session-hour', SESSION_LOG_NAMES[1], 60 * 60 * 1000);
+    mkdirSync(join(home, 'sessions', 'proj-c', 'session-nolog'), { recursive: true });
+
+    const found = listRecentSessionLogs(home, { withinMs: 24 * 60 * 60 * 1000 });
+    assert.deepEqual(found.map((entry) => entry.sessionId), ['session-fresh', 'session-hour']);
+    assert.equal(found[0].file, fresh, 'the older log name is the fallback, not a second entry');
+    assert.equal(readSessionLogTail(fresh).includes('"turn/start"'), true, 'the tail reader round-trips a real file');
+    assert.deepEqual(listRecentSessionLogs(join(root, 'nope'), {}), [], 'a missing home is empty, not a throw');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+await checkAsync('startup recovery seeds an episode and wakes a dormant session', async () => {
+  const seeded = [];
+  const woken = [];
+  const summary = await recoverInterruptedSessions({
+    config: normalizeConfig({}),
+    core: { observeInterrupt: (id, reason) => seeded.push([id, reason]) },
+    home: 'D:/home',
+    listLogs: () => [{ sessionId: 'session-a', project: 'p', file: 'D:/home/a', mtimeMs: 1700000000000 }],
+    readTail: () => logLine({ type: 'turn/start' }) + logLine({ type: 'tool/call' }),
+    resolveAgent: () => undefined,
+    wake: async (id) => { woken.push(id); },
+  });
+  assert.deepEqual(seeded, [['session-a', 'process.exit']]);
+  assert.deepEqual(woken, ['session-a'], 'a dormant session is woken through agents.resume');
+  assert.equal(summary.resumed, 1);
+  assert.equal(summary.woken, 1);
+});
+
+await checkAsync('a human stop is never resurrected by the scan', async () => {
+  const seeded = [];
+  const woken = [];
+  await recoverInterruptedSessions({
+    config: normalizeConfig({}),
+    core: { observeInterrupt: (id) => seeded.push(id) },
+    home: 'D:/home',
+    listLogs: () => [{ sessionId: 'session-user', project: 'p', file: 'f', mtimeMs: 1 }],
+    readTail: () => logLine({ type: 'turn/start' })
+      + logLine({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } }),
+    resolveAgent: () => undefined,
+    wake: async (id) => { woken.push(id); },
+  });
+  assert.deepEqual(seeded, [], 'a deliberate stop must produce no episode');
+  assert.deepEqual(woken, [], 'and must not be woken');
+});
+
+await checkAsync('the scan never races a session that is already running', async () => {
+  const seeded = [];
+  await recoverInterruptedSessions({
+    config: normalizeConfig({}),
+    core: { observeInterrupt: (id) => seeded.push(id) },
+    home: 'D:/home',
+    listLogs: () => [{ sessionId: 'session-run', project: 'p', file: 'f', mtimeMs: 1 }],
+    readTail: () => logLine({ type: 'turn/start' }),
+    resolveAgent: () => ({ status: 'running' }),
+  });
+  assert.deepEqual(seeded, [], 'a running session belongs to whoever is driving it');
+});
+
+await checkAsync('the scan obeys its cap and its switches', async () => {
+  const logs = [1, 2, 3, 4].map((n) => ({ sessionId: `session-${n}`, project: 'p', file: `f${n}`, mtimeMs: n }));
+  const run = async (config) => {
+    const seeded = [];
+    const summary = await recoverInterruptedSessions({
+      config: normalizeConfig(config),
+      core: { observeInterrupt: (id) => seeded.push(id) },
+      home: 'D:/home',
+      listLogs: () => logs,
+      readTail: () => logLine({ type: 'turn/start' }),
+    });
+    return { seeded, summary };
+  };
+  const capped = await run({ startupResumeLimit: 2 });
+  assert.deepEqual(capped.seeded, ['session-1', 'session-2'], 'the newest are taken first, up to the cap');
+  assert.equal(capped.summary.scanned, 4);
+  assert.deepEqual((await run({ startupResume: false })).seeded, [], 'the startup switch turns the scan off');
+  assert.deepEqual((await run({ autoResume: false })).seeded, [], 'recovery is an auto-resume, so it obeys that switch too');
+  assert.deepEqual((await run({ startupResumeLimit: 0 })).seeded, [], 'a zero cap means never');
+});
+
+await checkAsync('a session that cannot be reopened still keeps its episode', async () => {
+  const seeded = [];
+  const summary = await recoverInterruptedSessions({
+    config: normalizeConfig({}),
+    core: { observeInterrupt: (id) => seeded.push(id) },
+    home: 'D:/home',
+    listLogs: () => [{ sessionId: 'session-x', project: 'p', file: 'f', mtimeMs: 1 }],
+    readTail: () => logLine({ type: 'turn/start' }),
+    resolveAgent: () => undefined,
+    wake: async () => { throw new Error('agents.resume unavailable'); },
+  });
+  assert.deepEqual(seeded, ['session-x'], 'the episode survives, so opening it by hand still resumes it');
+  assert.equal(summary.woken, 0);
+  assert.deepEqual(summary.skipped, ['session-x']);
+});
+
+await checkAsync('the scan stays quiet when there is no session home', async () => {
+  const summary = await recoverInterruptedSessions({
+    config: normalizeConfig({}),
+    core: { observeInterrupt() { throw new Error('must not be reached'); } },
+    home: '',
+  });
+  assert.deepEqual(summary.skipped, ['no-home']);
+  assert.equal(summary.resumed, 0);
+});
+
+await checkAsync('a recovered process.exit episode is resumable by the real scheduler', async () => {
+  const { scheduler, clock, sent } = makeScheduler({ config: { startupResume: true } });
+  scheduler.observeInterrupt('s1', 'process.exit', { recovered: true }, undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(scheduler.snapshot('s1').armed, true, 'no network wait: a crash is not a connectivity question');
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 1);
+});
+
+await checkAsync('startupResume: false keeps a process.exit episode inert', async () => {
+  const { scheduler, clock, sent } = makeScheduler({ config: { startupResume: false } });
+  scheduler.observeInterrupt('s1', 'process.exit', null, undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  clock.advance(60000);
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 0, 'the switch must hold even for a crash-recovered episode');
 });
 
 // ── report ──────────────────────────────────────────────────────────────────
