@@ -277,6 +277,15 @@ window.__ModuleLoader__.load({
       React.useEffect(() => {
         const goDown = () => { setOnline(false); void call(API.network, { sessionId, down: true }); };
         const goUp = () => { setOnline(true); void call(API.network, { sessionId, down: false }); };
+        // ⚠️ Report the CURRENT state once on mount. A WiFi drop that happened
+        // BEFORE this page loaded fires no `offline` event — there is no edge to
+        // observe — so the host would never learn this machine is offline, and the
+        // discriminator it uses to tell a link failure from a model error would
+        // have no evidence to work with. Reporting the standing state closes that
+        // hole; the host treats it as a hint either way, never as a verdict.
+        if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+          void call(API.network, { sessionId, down: true });
+        }
         window.addEventListener('offline', goDown);
         window.addEventListener('online', goUp);
         return () => {

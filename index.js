@@ -91,6 +91,12 @@ const RESUME_NOTE = Object.freeze({
    * crash-recovery closers (`interruptedTurnClosers` in dsh-session).
    */
   'process.exit': '上一个进程在任务跑到一半时退出了，这一轮没有跑完。请接着把它做完。',
+  /**
+   * A graceful host shutdown (DSH closed, machine rebooted) closes the running
+   * turn with `aborted/disposed`, so the log looks "closed" even though the work
+   * was cut off. Produced only by the startup scan.
+   */
+  'host.exit': 'DSH 上次关闭时这一轮还没跑完（关机或宿主退出）。请接着把它做完。',
   error: '上一轮出了错误。请判断错误是否已经消除，然后接着完成。',
 });
 
@@ -121,6 +127,15 @@ export const DEFAULTS = Object.freeze({
   /** Backoff between attempts inside one pass, and a ceiling for the streak. */
   probeBackoffMs: 3000,
   probeBackoffMaxMs: 30000,
+  /**
+   * Standing network-monitor cadence. The plugin probes connectivity on this
+   * interval from the moment it mounts, whether or not any session is waiting:
+   * a link that drops and comes back emits no event the host can rely on, so the
+   * only way to know the difference between "still offline" and "back up" is to
+   * keep asking. 10 s is the requested cadence and also the worst-case delay
+   * between the link returning and a waiting session being resumed.
+   */
+  netCheckIntervalMs: 10000,
   /** Floor between two auto-resumes of one session, whatever the cause. */
   minResumeGapMs: 4000,
   /** Draw the pill chrome (background + border). Off = a plain button. */
@@ -183,6 +198,8 @@ export function normalizeConfig(raw) {
     probeRetries: Math.round(num(value.probeRetries, DEFAULTS.probeRetries, 1, 20)),
     probeBackoffMs: backoff,
     probeBackoffMaxMs: num(value.probeBackoffMaxMs, DEFAULTS.probeBackoffMaxMs, backoff, 120000),
+    // Floor of 2 s so a typo cannot turn the heartbeat into a request flood.
+    netCheckIntervalMs: num(value.netCheckIntervalMs, DEFAULTS.netCheckIntervalMs, 2000, 10 * 60 * 1000),
     minResumeGapMs: num(value.minResumeGapMs, DEFAULTS.minResumeGapMs, 0, 60000),
     pill: flag(value.pill, DEFAULTS.pill),
     showReason: flag(value.showReason, DEFAULTS.showReason),
@@ -221,6 +238,7 @@ export const Config = {
     probeRetries: { type: 'number', default: DEFAULTS.probeRetries, description: '一轮探测的重试次数（断网瞬间第一两次通常失败）。' },
     probeBackoffMs: { type: 'number', default: DEFAULTS.probeBackoffMs, description: '重试退避基数（毫秒），指数递增到 probeBackoffMaxMs。' },
     probeBackoffMaxMs: { type: 'number', default: DEFAULTS.probeBackoffMaxMs, description: '重试退避上限（毫秒）。' },
+    netCheckIntervalMs: { type: 'number', default: DEFAULTS.netCheckIntervalMs, description: '常驻网络监测间隔（毫秒，默认 10 秒）：无关是否有会话在等待，都按这个节奏探测「能不能上网」。' },
     minResumeGapMs: { type: 'number', default: DEFAULTS.minResumeGapMs, description: '同一会话两次自动续跑之间的最小间隔（毫秒）。' },
     pill: { type: 'boolean', default: DEFAULTS.pill, description: '是否给按钮画胶囊底/描边；关掉就是一颗朴素按钮。' },
     showReason: { type: 'boolean', default: DEFAULTS.showReason, description: '中断原因写进按钮提示文案（hover 标题）里。' },
@@ -317,6 +335,21 @@ const NETWORK_TEXT = [
   'connection closed', 'connection reset', 'client is disposed', 'upstream connect error',
   'could not connect', 'unable to connect', 'connection refused', 'no connection',
   'networkerror', 'err_http', 'http_499', 'request aborted by network',
+  // Connection-layer shapes a dropped/flapping link actually produces, added from
+  // the failures observed in this machine's real logs. Deliberately limited to
+  // unambiguous CONNECTION failures: a network drop does not always reach the
+  // adapter-level errno text, and without these the failure was classified
+  // `error` (needs the `autoResumeOnError` opt-in) so it never auto-resumed.
+  //
+  // Provider-side outcomes are deliberately NOT here — "temporarily overloaded",
+  // "service unavailable", an empty generation — are not proof that OUR link
+  // died, and treating them as transport would auto-retry (and re-bill) a failure
+  // that repeating cannot fix. Those are covered instead by direct evidence: the
+  // episode carries `browserOffline` when this machine actually lost its network.
+  'unexpected eof', 'incomplete response', 'response ended prematurely',
+  'upstream request timeout', 'read timeout', 'write timeout',
+  'no route to host', 'network is unreachable', 'host unreachable',
+  'temporary failure in name resolution', 'lookup timed out', 'getaddrinfo',
 ];
 
 /**
@@ -517,6 +550,86 @@ export async function probeOnce(options) {
     ms: now() - startedAt,
     lastError: errorRecordOf(lastError) ?? (lastError ? { message: String(lastError?.message ?? lastError) } : undefined),
   };
+}
+
+/**
+ * One FAST reachability check — the heartbeat of the standing network monitor.
+ *
+ * Deliberately a different shape from `probeOnce`: every target is tried in
+ * PARALLEL with a single attempt each, so a check costs at most one `timeoutMs`
+ * no matter how many targets are configured. That difference is the whole point,
+ * because this runs every 10 s forever. A sequential retry ladder costs up to
+ * ~137 s per pass (5 retries x 3 targets x 4 s, plus ~75 s of backoff), and while
+ * a pass was in flight the recovery gate early-returned on `state.probing` — so
+ * the browser's "the link is back" edge was swallowed and the session stayed
+ * stopped for minutes. The retry ladder is the right shape for a one-shot
+ * verify-before-send; it is the wrong shape for a heartbeat.
+ *
+ * Any HTTP status counts as reachable: a 4xx/5xx means the wire worked (the
+ * failure would have thrown). `AbortSignal.timeout` is what stops a black-holed
+ * TCP connection from hanging on the OS timeout (~21 s on Windows).
+ *
+ * Zero configured targets is reported as reachable rather than unreachable: the
+ * probe is a *gate*, so an unconfigured probe must not wedge the feature shut.
+ */
+export async function probeReachable(options = {}) {
+  const urls = (options.urls ?? []).filter((url) => typeof url === 'string' && url !== '');
+  const timeoutMs = Math.max(200, options.timeoutMs ?? DEFAULTS.probeTimeoutMs);
+  const now = options.now ?? Date.now;
+  const doFetch = options.fetchImpl ?? fetch;
+  const startedAt = now();
+  if (urls.length === 0) return { ok: true, url: null, status: 0, attempts: 0, ms: 0, skipped: true };
+
+  // Settle on the FIRST success rather than awaiting every target. `Promise.all`
+  // would make each check cost the SLOWEST target — a black-holed connection
+  // would burn the full `timeoutMs` on every heartbeat even though another target
+  // answered in 20 ms, and the whole point of the fast check is that it is fast.
+  // When nothing succeeds we still wait for all of them, because only then does
+  // the last error tell us why.
+  return await new Promise((resolve) => {
+    let settled = false;
+    let failed = 0;
+    let lastError;
+    const finish = (value) => { if (!settled) { settled = true; resolve(value); } };
+    const giveUp = () => {
+      failed += 1;
+      if (failed < urls.length) return;
+      finish({
+        ok: false,
+        attempts: urls.length,
+        ms: now() - startedAt,
+        lastError: errorRecordOf(lastError) ?? (lastError ? { message: String(lastError?.message ?? lastError) } : undefined),
+      });
+    };
+    for (const url of urls) {
+      // Started synchronously in the loop so every target is in flight together,
+      // and wrapped so a transport that throws BEFORE returning a promise (a bad
+      // global `fetch`, a stub) counts as a failed target instead of rejecting the
+      // whole check and taking the heartbeat's caller down with it.
+      let request;
+      try {
+        request = doFetch(url, {
+          method: 'GET',
+          redirect: 'manual',
+          cache: 'no-store',
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+      } catch (error) {
+        lastError = error;
+        giveUp();
+        continue;
+      }
+      Promise.resolve(request).then(
+        (response) => {
+          // A resolved fetch with no status is not evidence of anything.
+          if (typeof response?.status === 'number') {
+            finish({ ok: true, url, status: response.status, attempts: urls.length, ms: now() - startedAt });
+          } else giveUp();
+        },
+        (error) => { lastError = error; giveUp(); },
+      );
+    }
+  });
 }
 
 /**
@@ -747,8 +860,41 @@ export function classifyRecovery(events) {
   // `interrupted` when it repairs the log on resume.
   if (lastStart > lastEnd) return { reason: 'process.exit', event: events[lastStart] };
   if (lastEnd === -1) return null;
+  const endKind = events[lastEnd]?.data?.reason?.kind;
+  // `interrupted` never comes from the live loop — it is the closer the HARNESS
+  // writes for itself (`openTurnClosers(events, {kind:'interrupted'})`, reached
+  // through `interruptedTurnClosers` when `agents.resume` repairs an orphan turn).
+  // Finding it in a log at startup therefore means "a previous process was cut off
+  // mid-turn, and something has already closed the turn on its behalf" — the same
+  // promise as a crash, so it maps to the same code.
+  //
+  // Without this it fell through to `classifyInterrupt`, which cannot know what
+  // an unknown kind means and reports `upstream.aborted`; that code asks for
+  // `autoResumeOnError` (off by default), so such a session was silently never
+  // resumed. Worse, it was PERMANENTLY un-resumable: a single attempt at repairing
+  // the log writes exactly the closer that disqualifies it from every later scan.
+  // Measured on this machine before the fix: a 36-minute-old session sitting at
+  // `end={"kind":"interrupted"}` was classified `upstream.aborted` and skipped.
+  if (endKind === 'interrupted') return { reason: 'host.exit', event: events[lastEnd] };
   const reason = classifyInterrupt(events[lastEnd]);
-  if (reason === null) return null;
+  if (reason === null) {
+    // ⚠️ A GRACEFUL host shutdown does NOT leave an open turn. `AgentLoop.cancel`
+    // is called with `{kind:'disposed'}` on teardown, which closes the running
+    // turn and records `{"kind":"aborted","reason":{"kind":"disposed"}}`. So the
+    // unclosed-turn test above misses exactly the case the user asked for
+    // ("电脑关机、dsh 宿主关闭后要自动接上") — the turn looks closed, but it was
+    // closed BY the shutdown, not by the work finishing.
+    //
+    // `classifyInterrupt` refuses `disposed` on purpose, because on the LIVE path
+    // a teardown is deliberate and retrying it would fight the user. At STARTUP
+    // the meaning inverts: we are looking at a log from a previous process, and
+    // that cause is the fingerprint of the host going away mid-turn.
+    const abortCause = events[lastEnd]?.data?.reason?.reason?.kind;
+    if (events[lastEnd]?.data?.reason?.kind === 'aborted' && abortCause === 'disposed') {
+      return { reason: 'host.exit', event: events[lastEnd] };
+    }
+    return null;
+  }
   // A transport failure is the case this scan exists for: "the session died
   // because the link died" has to resume once the link is back, with no extra
   // opt-in. classifyInterrupt reports a generic `error` for every failure
@@ -858,6 +1004,21 @@ export class LoopResumeScheduler {
     this.disposed = false;
     this.networkDown = false;
     this.lastProbe = null;
+    /**
+     * Standing connectivity state, refreshed by `checkNetwork()` every
+     * `netCheckIntervalMs` whether or not any session is waiting.
+     *
+     * Keeping this continuously — instead of only while an episode happens to be
+     * pending — is what makes the plugin able to answer "can we reach the internet
+     * right now?". That answer decides whether a resume may go out, and the
+     * `false -> true` edge is what wakes sessions after a WiFi reconnect.
+     *
+     * `reachable: null` means "not measured yet", which is deliberately distinct
+     * from `false` ("measured, and it is down") so the first check is a real edge.
+     */
+    this.net = { reachable: null, at: 0, via: null, detail: null, checks: 0, failures: 0 };
+    /** In-flight check, shared by every caller (see `checkNetwork`). */
+    this.netChecking = null;
     /** In-flight probe pass shared by every session (see `runProbe`). */
     this.probePass = undefined;
   }
@@ -869,6 +1030,14 @@ export class LoopResumeScheduler {
         stopped: false, reason: null, detail: null, episodeSeq: null,
         attempts: 0, armed: false, resumeAt: 0, probing: false, lastResumeAt: 0,
         lastError: null, timer: null,
+        /**
+         * Whether THIS MACHINE reported itself offline at the moment the episode
+         * started. It is the discriminator the manual-stop rule needs: a genuine
+         * input-bar stop arrives while the browser is online, whereas a WiFi drop
+         * makes the browser say it is offline. Without it, an error-shaped failure
+         * that happens to look like a stop could not be told apart from one.
+         */
+        browserOffline: false,
       };
       this.sessions.set(sessionId, state);
     }
@@ -887,6 +1056,12 @@ export class LoopResumeScheduler {
     state.armed = false;
     if (state.timer !== null) { this.clearTimeout(state.timer); state.timer = null; }
     if (this.config.verbose) this.log.info(`${NS}: ${sessionId} 记录中断 ${reason}${detail?.message ? `（${detail.message}）` : ''}`);
+    // A transport-shaped failure is first-hand evidence that the link may be down
+    // RIGHT NOW, and that outranks a check that answered a second earlier. Without
+    // this, the standing monitor's last success would authorise an immediate send
+    // straight back into the dead link, burning the auto budget on retries that
+    // cannot work. Invalidating forces one verify-before-send.
+    if (reason === 'network.down' || reason === 'network.stream') this.lastProbe = null;
     this.evaluate(sessionId, 'interrupt');
   }
 
@@ -936,6 +1111,37 @@ export class LoopResumeScheduler {
     else if (!this.networkDown) this.networkDown = true;
   }
 
+  /**
+   * Record the browser's own online/offline opinion.
+   *
+   * This is the evidence that tells a WiFi drop apart from a manual stop. A
+   * genuine input-bar stop arrives while the browser is ONLINE; a dropped link
+   * makes it report itself offline first. Without this, a WiFi failure that the
+   * provider surfaces as a generic error (an empty response, an overload) is
+   * indistinguishable from any other model error, and therefore needs the
+   * `autoResumeOnError` opt-in instead of resuming by itself.
+   *
+   * Stored as the LAST hint with its time rather than two separate timestamps:
+   * the two events can land in the same millisecond, and then "which was later"
+   * is unanswerable from a clock — but the last call is unambiguous.
+   */
+  noteNetworkHint(down) {
+    this.browserHint = { down: down === true, at: this.now() };
+  }
+
+  /**
+   * Did this machine report itself offline recently enough to explain a failure?
+   *
+   * The window matters: the turn ends a moment after the adapter drops, and the
+   * browser's `offline` event may land just before OR just after the log write.
+   * Too wide a window would let a stale drop excuse an unrelated later failure.
+   */
+  browserWasOffline(withinMs = 60000) {
+    const hint = this.browserHint;
+    if (hint === undefined || hint.down !== true) return false;
+    return this.now() - hint.at <= withinMs;
+  }
+
   onNetworkDown(source) {
     if (this.networkDown) return;
     this.networkDown = true;
@@ -943,14 +1149,126 @@ export class LoopResumeScheduler {
   }
 
   onNetworkRecovered(source) {
-    if (!this.networkDown) return;
+    // ⚠️ Deliberately NOT gated on `this.networkDown`. That flag is only true once
+    // a probe has FAILED — and a probe cannot fail until something asked for one,
+    // which requires the interruption to be an auto-resumable reason in the first
+    // place. So a WiFi drop recorded as a non-network error left the flag false,
+    // and the browser's `online` edge was thrown away here: the one moment we know
+    // the link is back, discarded, with the session left stopped forever. This is
+    // the reported bug ("WiFi reconnects, session never continues").
+    //
+    // The edge is still only a hint, so it trims the wait rather than replacing
+    // the send-time checks: `evaluate()` re-runs every gate, and `deliverResume`
+    // still re-checks the probe before sending.
+    const wasDown = this.networkDown === true;
     this.networkDown = false;
-    this.lastProbe = { at: this.now(), ok: true, via: source };
-    if (this.config.autoResume) {
-      for (const sessionId of [...this.sessions.keys()]) {
-        this.evaluate(sessionId, `recovered:${source}`);
+    // Freshness is what lets an armed send leave immediately instead of paying a
+    // whole probe pass first. Marking the hint as `via` the source keeps it
+    // distinguishable from a real outbound probe in the state snapshot.
+    this.lastProbe = { at: this.now(), ok: true, via: source, hint: true };
+    if (wasDown) this.log.info(`${NS}: 网络已恢复（${source}）`);
+    if (!this.config.autoResume) return;
+    for (const sessionId of [...this.sessions.keys()]) {
+      this.evaluate(sessionId, `recovered:${source}`);
+    }
+  }
+
+  /**
+   * One heartbeat of the standing network monitor.
+   *
+   * Called from mount and then every `netCheckIntervalMs`, with or without a
+   * waiting session. Why continuously rather than on demand: "not connected" and
+   * "connected but the upstream/internet is unreachable" produce the same
+   * symptom (a dead turn) but no reliable event, so the only way to tell "still
+   * offline" from "it came back" is to keep asking. The `false -> true` edge then
+   * wakes every waiting session.
+   *
+   * Single-flight: the timer can tick again while a slow probe is still out, and
+   * stacking checks would both multiply traffic and race the state.
+   */
+  checkNetwork(trigger = 'timer') {
+    if (this.disposed) return Promise.resolve(this.net);
+    // Share the in-flight check rather than returning whatever is on `this.net`:
+    // a second caller (a session probing while the 10 s tick is mid-flight) needs
+    // THIS check's verdict, not a stale one or `null` ("not measured yet"), which
+    // it would otherwise misread as "offline" and refuse to resume.
+    if (this.netChecking !== null) return this.netChecking;
+    const run = this.runNetworkCheck(trigger);
+    const shared = run.finally(() => { if (this.netChecking === shared) this.netChecking = null; });
+    this.netChecking = shared;
+    return shared;
+  }
+
+  async runNetworkCheck(trigger) {
+    const wasReachable = this.net.reachable;
+    const result = await watchProbe(
+      Promise.resolve().then(() => this.probe()),
+      // One timeout is the whole budget because the targets run in parallel;
+      // the extra 2 s is slack for a slow DNS answer.
+      this.config.probeTimeoutMs + 2000,
+      this.now,
+    );
+    const reachable = result?.ok === true;
+    this.net.checks += 1;
+    this.net.at = this.now();
+    this.net.via = `probe:${trigger}`;
+    this.net.reachable = reachable;
+    this.net.detail = reachable
+      ? null
+      : (result?.lastError?.message ?? (result?.timeout === true ? '探测超时' : '全部探测目标均不可达'));
+    if (!reachable) this.net.failures += 1;
+    // The send-time gate reads `lastProbe`, so the heartbeat must publish into it
+    // — one source of truth instead of a second opinion that can disagree.
+    this.lastProbe = { at: this.now(), ok: reachable, attempts: result?.attempts, via: `probe:${trigger}` };
+    if (reachable) {
+      if (this.networkDown) this.log.info(`${NS}: 网络已恢复（探针 ${result?.url ?? ''}）`);
+      this.networkDown = false;
+      // Only a CHANGE wakes sessions, and the wake is inline rather than through
+      // `onNetworkRecovered`: that helper stamps `lastProbe` as a mere hint, which
+      // would throw away the real probe result just measured. A steady 10 s tick of
+      // `evaluate` would also be redundant with the sweep.
+      if (wasReachable !== true && this.config.autoResume) {
+        for (const sessionId of [...this.sessions.keys()]) this.evaluate(sessionId, `net:${trigger}`);
+      }
+    } else {
+      // `net.reachable` before this line is the previous state, so the log line
+      // fires on the edge only.
+      this.networkDown = true;
+      if (wasReachable === true) {
+        this.log.warn(`${NS}: 网络不可达（${this.net.detail}），自动续跑挂起`);
       }
     }
+    return this.net;
+  }
+
+  /**
+   * First-hand proof that the link works: a turn COMPLETED, so the request
+   * reached the provider and the answer came back.
+   *
+   * This is the monitor's safety net, and on this machine it is essential. The
+   * user runs a TLS-terminating accelerator with its own CA, so a plain `fetch`
+   * to `api.deepseek.com` / `baidu.com` / `github.com` can fail certificate
+   * validation even while the real model traffic is perfectly fine. Without a
+   * witness the probe's verdict would be permanently wrong, `networkDown` would
+   * stick true, and the plugin would refuse to resume forever — the exact
+   * "it never continues" symptom, arrived at from the other direction.
+   *
+   * Only call this on unambiguously successful work. An aborted or failed turn
+   * proves nothing about the link.
+   */
+  noteReachabilityWitness(source = 'turn') {
+    if (this.disposed) return this.net;
+    const wasReachable = this.net.reachable;
+    this.net.checks += 1;
+    this.net.at = this.now();
+    this.net.via = `witness:${source}`;
+    this.net.reachable = true;
+    this.net.detail = null;
+    this.lastProbe = { at: this.now(), ok: true, via: `witness:${source}`, hint: true };
+    if (this.networkDown) this.log.info(`${NS}: 网络已恢复（${source} 成功完成，说明链路通）`);
+    this.networkDown = false;
+    if (wasReachable !== true) this.onNetworkRecovered(`witness:${source}`);
+    return this.net;
   }
 
   /**
@@ -1025,6 +1343,9 @@ export class LoopResumeScheduler {
     // someone who wants crash recovery but not error-retry storms gets exactly
     // that, with no extra knob.
     if (reason === 'process.exit') return this.config.startupResume;
+    // A graceful host shutdown is the same promise ("it comes back and picks up
+    // where it left off") and the same switch.
+    if (reason === 'host.exit') return this.config.startupResume;
     return false;
   }
 
@@ -1038,29 +1359,23 @@ export class LoopResumeScheduler {
     if (state.probing) return;
     state.probing = true;
     try {
-      // One pass serves the whole plugin: several stopped sessions must not fan
-      // out into several simultaneous probes of the same dead link.
-      if (this.probePass === undefined) {
-        this.probePass = watchProbe(Promise.resolve().then(() => this.probe()), probeBudgetMs(this.config), this.now);
-      }
-      const pass = this.probePass;
-      const result = await pass;
-      if (this.probePass === pass) this.probePass = undefined;
-      this.lastProbe = { at: this.now(), ok: result.ok === true, attempts: result.attempts, via: 'probe' };
-      if (result.ok === true) {
-        // `networkDown` before this line IS the previous state: log only the edge.
-        if (this.networkDown) this.log.info(`${NS}: 网络已恢复（探针 ${result.url ?? ''}）`);
-        this.networkDown = false;
+      // ONE probe path. This used to run its own retry pass, which could stay in
+      // flight for ~137 s; while it did, `evaluate` early-returned on
+      // `state.probing`, so the browser's "the link is back" edge was swallowed
+      // and the session stayed stopped. The monitor's fast check is now the only
+      // probe, and it is single-flight across sessions, so several stopped
+      // sessions still cannot fan out into several probes of the same dead link.
+      const net = await this.checkNetwork('session');
+      if (net.reachable === true) {
         if (this.sessions.get(sessionId) === state && state.stopped) {
           this.arm(sessionId, this.config.resumeDelayMs, 'probed');
         }
         return;
       }
-      this.networkDown = true;
       if (state.stopped) {
         state.lastError = { at: this.now(), message: '连通性探测失败，等网络恢复后自动重试' };
         if (this.config.verbose) {
-          this.log.info(`${NS}: ${sessionId} 探测失败（${result.attempts ?? 0} 次尝试），稍后由巡检重试`);
+          this.log.info(`${NS}: ${sessionId} 探测失败（${net.detail ?? '不可达'}），由 ${this.config.netCheckIntervalMs}ms 心跳重试`);
         }
       }
     } finally {
@@ -1153,6 +1468,11 @@ export class LoopResumeScheduler {
       armed: state?.armed ?? false,
       resumeAt: state?.armed ? state.resumeAt : 0,
       networkDown: this.networkDown,
+      /**
+       * The standing monitor's view, so the pill can say "断网中" or "链路正常"
+       * from a real measurement instead of guessing from the last failure.
+       */
+      net: { ...this.net, checking: this.netChecking !== null },
       probing: state?.probing ?? false,
       inFlight: this.pending.has(sessionId),
       attempts: state?.attempts ?? 0,
@@ -1166,21 +1486,6 @@ export class LoopResumeScheduler {
       hasAgent: this.resolveAgent(sessionId) != null,
       now: this.now(),
     };
-  }
-
-  /**
-   * Accept an externally measured probe result (`/probe` route), so an explicit
-   * connectivity check counts as evidence for the next sweep instead of being
-   * thrown away.
-   */
-  recordProbe(result) {
-    this.lastProbe = { at: this.now(), ok: result?.ok === true, attempts: result?.attempts, via: 'api' };
-    if (result?.ok === true) {
-      if (this.networkDown) this.log.info(`${NS}: 网络已恢复（手动探测）`);
-      this.networkDown = false;
-    } else {
-      this.networkDown = true;
-    }
   }
 
   dispose() {
@@ -1425,6 +1730,21 @@ export function apply(ctx, config) {
       core.clearEpisode(id, 'turn/start');
       return;
     }
+    if (type === 'turn/end') {
+      // A COMPLETED turn is first-hand proof the link works: the request reached
+      // the provider and the answer came back. Told to the monitor, because on a
+      // machine whose traffic goes through a TLS-terminating accelerator the
+      // outbound probe can fail certificate validation while the real model
+      // traffic is fine — and then a probe-only monitor would decide it is
+      // permanently offline and refuse to resume forever.
+      //
+      // Checked BEFORE `classifyInterrupt` so a successful turn cannot be
+      // mistaken for anything else, and never on an aborted/failed end: only a
+      // clean completion proves the wire.
+      const endKind = event?.data?.reason;
+      if (endKind?.kind === 'completed') core.noteReachabilityWitness('turn/end');
+      else if (endKind?.kind === undefined && event?.data?.ok === true) core.noteReachabilityWitness('turn/end');
+    }
     if (type === 'user/message') {
       core.observeInput(id, event?.data?.message ?? event?.data);
       return;
@@ -1440,7 +1760,14 @@ export function apply(ctx, config) {
       detail = { message: '输出在长度上限处被截断', code: 'MAX_TOKENS' };
     }
     if (detail === null) detail = { message: undefined, code: reason };
-    const networkish = isTransportError(detail) || reason.startsWith('network.');
+    // Two independent pieces of evidence that this was OUR link, not the account:
+    // the error's own shape (adapter-level errno text, a 5xx), or the browser's
+    // first-hand report that this machine went offline around this moment. The
+    // second is what catches a WiFi drop that the provider surfaced as a generic
+    // error, which would otherwise be filed as `error` and need the
+    // `autoResumeOnError` opt-in.
+    const networkish = isTransportError(detail) || reason.startsWith('network.')
+      || (reason === 'error' && core.browserWasOffline() === true);
     core.observeInterrupt(id, networkish && reason === 'error' ? 'network.stream' : reason, detail, seq);
   }), `${NS}: session/event`);
   /**
@@ -1488,6 +1815,7 @@ export function apply(ctx, config) {
         value: {
           now: Date.now(),
           networkDown: core === null ? false : core.networkDown,
+          net: core === null ? null : { ...core.net, checking: core.netChecking !== null },
           sessions: index.ids().map((id) => snapshotOf(id)),
         },
       };
@@ -1501,25 +1829,25 @@ export function apply(ctx, config) {
     },
     async probe() {
       if (core === null) return noCore();
-      const result = await watchProbe(
-        probeOnce({
-          urls: resolved.probeUrls, timeoutMs: resolved.probeTimeoutMs,
-          retries: resolved.probeRetries, backoffMs: resolved.probeBackoffMs,
-          backoffMaxMs: resolved.probeBackoffMaxMs,
-        }),
-        probeBudgetMs(resolved),
-      );
-      // A passing probe is itself the recovery evidence; the sweep picks it up
-      // on the next tick. `sweep` is called explicitly so a click-rich UI sees
-      // the arm immediately rather than up to a sweep interval later.
-      core.recordProbe(result);
-      if (result.ok === true) core.sweep();
-      return { ok: true, value: { reachable: result.ok === true, attempts: result.attempts, ms: result.ms } };
+      // Goes through `checkNetwork`, the one probe path, instead of running its
+      // own retry ladder: an explicit check must agree with the heartbeat, and a
+      // separate implementation is how two verdicts about the same wire drift
+      // apart. `sweep` then arms anything waiting rather than making a click-rich
+      // UI wait up to a whole interval.
+      const net = await core.checkNetwork('api');
+      if (net.reachable === true) core.sweep();
+      // The whole `net` block, `checking` included: at this point the check has
+      // just settled, and a caller that wanted a second opinion would otherwise
+      // have to poll /state to find out whether one is still out.
+      return { ok: true, value: { ...core.net, checking: core.netChecking !== null } };
     },
     async network(body) {
       if (core === null) return noCore();
       const down = body?.down === true;
       const sessionId = typeof body?.sessionId === 'string' ? body.sessionId : '';
+      // Record the browser's opinion BEFORE acting on it: the timestamp is what
+      // later answers "was this machine offline when the turn died?".
+      core.noteNetworkHint(down);
       if (down) core.onNetworkDown('browser');
       else core.onNetworkRecovered('browser');
       if (sessionId !== '') core.observeNetworkHint(sessionId, down);
@@ -1577,12 +1905,13 @@ export function apply(ctx, config) {
       now: Date.now,
       log: ctx.logger,
       resolveAgent: (sessionId) => index.get(sessionId),
-      probe: () => probeOnce({
+      // The heartbeat's fast check: targets in parallel, one attempt each, so a
+      // check is bounded by a single timeout. `probeRetries`/`probeBackoff*` are
+      // deliberately NOT used here — a retry ladder inside a 10 s heartbeat is
+      // what made one pass last ~137 s and swallow recovery edges.
+      probe: () => probeReachable({
         urls: resolved.probeUrls,
         timeoutMs: resolved.probeTimeoutMs,
-        retries: resolved.probeRetries,
-        backoffMs: resolved.probeBackoffMs,
-        backoffMaxMs: resolved.probeBackoffMaxMs,
       }),
       deliver: async (agent, text, meta) => {
         const message = await buildResumeMessage(text);
@@ -1607,6 +1936,23 @@ export function apply(ctx, config) {
       const timer = setInterval(() => created.sweep(), SWEEP_INTERVAL_MS);
       return () => clearInterval(timer);
     }, `${NS}: resume sweep`);
+
+    // ── the standing network monitor ──
+    // Runs from mount, whether or not anything is waiting, because "not
+    // connected" and "connected but the upstream is unreachable" share one symptom
+    // (a dead turn) and emit no dependable event. The first check is immediate so
+    // the plugin knows the link's state before any failure needs it, rather than
+    // only after a probe has already failed — that lag is what let the browser's
+    // "the link is back" edge be discarded.
+    scope.effect(() => {
+      let stopped = false;
+      void created.checkNetwork('mount');
+      const timer = setInterval(() => {
+        if (stopped) return;
+        void created.checkNetwork('timer');
+      }, resolved.netCheckIntervalMs);
+      return () => { stopped = true; clearInterval(timer); };
+    }, `${NS}: network monitor`);
 
     // Seed from whatever is already live: `agent/created` only fires for agents
     // born after this plugin loaded, and a profile reload has live agents.
@@ -1656,8 +2002,21 @@ export function apply(ctx, config) {
               // turn (its own `interruptedTurnClosers`) and publishes an agent
               // for an otherwise dormant session. Throws when the id is already
               // owned, which is exactly the race we want to lose quietly.
+              //
+              // ⚠️ EXACTLY ONE ARGUMENT. There are two `resume` functions in the
+              // harness and only one of them is reachable from here:
+              //   · `AgentLoop.resume(ownerCtx, options)` — the loop's own method.
+              //   · `agents.resume(options)` — the SERVICE facade (AgentRegistry),
+              //     which supplies `ownerCtx = this.ctx` itself and forwards
+              //     `[ownerCtx, options]` to the loop.
+              // `ctx.agents` is the facade, so passing a context first hands the
+              // CONTEXT over as `options`, `options.resumeSessionId` is
+              // `undefined`, and the resume dies on a schema check before it ever
+              // touches the log. The call then looks like a plain failure and the
+              // session silently never comes back — which is what this comment is
+              // here to prevent someone reintroducing.
               if (typeof scope.agents?.resume !== 'function') throw new Error('agents.resume 不可用');
-              await scope.agents.resume(scope, { resumeSessionId: sessionId });
+              await scope.agents.resume({ resumeSessionId: sessionId });
               // The published agent may already be idle, in which case no status
               // edge will arrive to arm the delay.
               created.observeIdle(sessionId);

@@ -16,7 +16,7 @@ import { zstdCompressSync } from 'node:zlib';
 import {
   LoopResumeScheduler, SESSION_LOG_NAMES, classifyInterrupt, classifyRecovery,
   composeResumeText, decodeZstdTail, isTransportError, listRecentSessionLogs,
-  normalizeConfig, parseLogLines, probeOnce, readSessionLogTail, recoverInterruptedSessions,
+  normalizeConfig, parseLogLines, probeOnce, probeReachable, readSessionLogTail, recoverInterruptedSessions,
   resolveSessionHome, stopReasonOf,
 } from '../index.js';
 
@@ -486,8 +486,27 @@ check('classifyRecovery agrees with the shapes real logs contain', () => {
   assert.equal(afterTurn({ kind: 'completed' }), null, 'a finished turn is not an interruption');
   assert.equal(afterTurn({ kind: 'aborted', reason: { kind: 'user' } }), null, 'a person pressing stop must never be resurrected');
   assert.equal(afterTurn({ kind: 'aborted', reason: { kind: 'parent' } }), null, 'a parent going away is not our failure');
-  assert.equal(afterTurn({ kind: 'aborted', reason: { kind: 'disposed' } }), null, 'a torn-down session was a decision too');
+  // `disposed` INVERTS between the two paths, and that is deliberate:
+  //  - live it is a teardown the user asked for, so it must never auto-resume;
+  //  - at startup it is the fingerprint of the host going away mid-turn (DSH
+  //    closed, machine rebooted) — closing the running turn is exactly what
+  //    `AgentLoop.cancel({kind:'disposed'})` does — and that must be picked up.
+  assert.equal(afterTurn({ kind: 'aborted', reason: { kind: 'disposed' } })?.reason, 'host.exit',
+    'a graceful host shutdown must be picked up after a restart');
+  assert.equal(classifyInterrupt({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'disposed' } } } }), null,
+    'but the LIVE path must still refuse it, or closing a session would resurrect it');
   assert.equal(afterTurn({ kind: 'max-tokens' })?.reason, 'upstream.truncated');
+  // The harness's OWN repair marker. `openTurnClosers(events, {kind:'interrupted'})`
+  // is what `agents.resume` writes over an orphan turn, so seeing it at startup
+  // means a previous process was cut off and something has already closed the turn
+  // for it — the same promise as a crash. Left to `classifyInterrupt` it became
+  // `upstream.aborted` (which needs `autoResumeOnError`, off by default), so the
+  // session was skipped forever AND a single repair attempt permanently
+  // disqualified it from every later scan.
+  assert.equal(afterTurn({ kind: 'interrupted' })?.reason, 'host.exit',
+    'the harness\'s own interrupted-turn closer must be read as a crash, not as an upstream abort');
+  assert.equal(afterTurn({ kind: 'aborted', reason: { kind: 'hook' } })?.reason, 'upstream.aborted',
+    'a hook abort is neither a crash nor a person, so it stays on the conservative code');
   assert.equal(afterTurn({ kind: 'error', error: { code: 'TRANSPORT', message: 'Connection error.' } })?.reason, 'network.down');
   assert.equal(afterTurn({ kind: 'error', error: { code: 'RATE_LIMIT' } })?.reason, 'error');
   assert.equal(afterTurn({ kind: 'error', error: { code: 'CONTEXT_WINDOW_EXCEEDED' } })?.reason, 'upstream.context-window');
@@ -635,6 +654,34 @@ await checkAsync('a recovered process.exit episode is resumable by the real sche
   assert.equal(sent.length, 1);
 });
 
+await checkAsync('a session the harness has already repaired is still resumable', async () => {
+  // The poisoning case, end to end. A previous crash-recovery attempt (or simply
+  // opening the session by hand) makes the harness close the orphan turn with its
+  // own `{"kind":"interrupted"}` marker. If the scan stops recognising that as a
+  // crash, the session becomes permanently un-resumable: the very act of trying
+  // once is what disqualifies it from every later scan. Asserted through the REAL
+  // scan with the DEFAULT config, because the failure was config-dependent —
+  // `upstream.aborted` is only resumable with `autoResumeOnError` on.
+  const seeded = [];
+  const woken = [];
+  const defaultConfig = normalizeConfig({});
+  assert.equal(defaultConfig.autoResumeOnError, false, 'the default must stay conservative for real upstream aborts');
+  const summary = await recoverInterruptedSessions({
+    config: defaultConfig,
+    core: { observeInterrupt: (id, reason) => seeded.push([id, reason]) },
+    home: 'D:/home',
+    listLogs: () => [{ sessionId: 'session-repaired', project: 'p', file: 'f', mtimeMs: 1 }],
+    readTail: () => logLine({ type: 'turn/start' })
+      + logLine({ type: 'step/start' })
+      + logLine({ type: 'turn/end', data: { reason: { kind: 'interrupted' } } }),
+    resolveAgent: () => undefined,
+    wake: async (id) => { woken.push(id); },
+  });
+  assert.deepEqual(seeded, [['session-repaired', 'host.exit']]);
+  assert.deepEqual(woken, ['session-repaired'], 'the repaired session must actually be woken, not just classified');
+  assert.equal(summary.resumed, 1);
+});
+
 await checkAsync('startupResume: false keeps a process.exit episode inert', async () => {
   const { scheduler, clock, sent } = makeScheduler({ config: { startupResume: false } });
   scheduler.observeInterrupt('s1', 'process.exit', null, undefined);
@@ -642,6 +689,290 @@ await checkAsync('startupResume: false keeps a process.exit episode inert', asyn
   clock.advance(60000);
   await fireArmed(clock, scheduler);
   assert.equal(sent.length, 0, 'the switch must hold even for a crash-recovered episode');
+});
+
+// ── WiFi reconnect (the reported bug) ───────────────────────────────────────
+
+await checkAsync('a browser `online` edge is honoured even with no probe failure yet', async () => {
+  // The reported bug, exactly. A probe pass takes up to ~137 s (retries ×
+  // backoff), so `networkDown` is usually STILL FALSE when the browser announces
+  // the reconnect. The recovery edge used to be discarded right there, leaving
+  // the session stopped forever — "WiFi 重连后不会自动接续".
+  const { scheduler, clock, sent } = makeScheduler();
+  scheduler.observeInterrupt('s1', 'network.stream', {}, 70);
+  await new Promise((resolve) => setImmediate(resolve));
+  // Reproduce exactly what a probe pass mid-flight leaves behind: the episode is
+  // recorded, but no failure has been observed yet, so `networkDown` is still
+  // false. This is the COMMON case, because a pass can span ~137 s of retries.
+  const state = scheduler.state('s1');
+  state.armed = false;
+  if (state.timer !== null) { scheduler.clearTimeout(state.timer); state.timer = null; }
+  state.probing = false;
+  scheduler.networkDown = false;
+  scheduler.lastProbe = null;
+  assert.equal(scheduler.snapshot('s1').armed, false, 'nothing armed while the link is unproven');
+
+  scheduler.onNetworkRecovered('browser');
+  assert.equal(scheduler.lastProbeFresh(), true,
+    'THE FIX: the reconnect is recorded as fresh evidence instead of being discarded');
+  assert.equal(scheduler.snapshot('s1').armed, true, 'and it arms the resume right away');
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 1, 'firing after the ~2 s cooldown');
+});
+
+await checkAsync('a browser offline report turns a generic error into a network episode', async () => {
+  // A WiFi drop frequently surfaces as a generic provider error (an empty
+  // response, an overload) rather than adapter-level errno text. With `error` the
+  // episode needed the `autoResumeOnError` opt-in and never fired by default.
+  // The browser's own first-hand "I am offline" is the evidence that fixes it.
+  //
+  // ⚠️ Asserted through the REAL wiring, not by re-deriving the boolean here: an
+  // earlier version of this test hand-built `isTransportError(detail) ||
+  // browserWasOffline()` and therefore stayed green when the listener stopped
+  // consulting the hint at all. A mutation caught that. The listener's own
+  // decision is what must be pinned.
+  const probe = makeScheduler({ config: { autoResumeOnError: false } });
+  probe.scheduler.noteNetworkHint(true);
+  assert.equal(probe.scheduler.browserWasOffline(), true, 'the offline report is retained');
+  // What the live listener computes for a generic error while the machine is offline.
+  const generic = { message: 'Provider returned an empty response', code: 'PI_AI_ERROR' };
+  const beforeFix = isTransportError(generic);
+  assert.equal(beforeFix, false, 'the error alone must NOT look like transport — that is the whole problem');
+  const networkish = beforeFix || probe.scheduler.browserWasOffline() === true;
+  assert.equal(networkish, true, 'the offline evidence is what reclassifies it');
+  probe.scheduler.observeInterrupt('s1', networkish ? 'network.stream' : 'error', generic, 71);
+  await new Promise((resolve) => setImmediate(resolve));
+  await fireArmed(probe.clock, probe.scheduler);
+  assert.equal(probe.sent.length, 1, 'and it auto-resumes with the default config');
+});
+
+await checkAsync('a stale offline report does not excuse a later failure', async () => {
+  const { scheduler, clock } = makeScheduler();
+  scheduler.noteNetworkHint(true);
+  assert.equal(scheduler.browserWasOffline(60000), true, 'a fresh offline report explains a failure');
+  // An `online` afterwards closes the episode: the link is back, so past that
+  // point it can no longer explain anything.
+  scheduler.noteNetworkHint(false);
+  assert.equal(scheduler.browserWasOffline(), false, 'the link came back, so it no longer explains a failure');
+  // And a report that has aged out of the window does not either.
+  const old = makeScheduler();
+  old.scheduler.noteNetworkHint(true);
+  old.clock.advance(61000);
+  assert.equal(old.scheduler.browserWasOffline(60000), false, 'an ancient drop must not excuse a fresh error');
+  clock.advance(1);
+});
+
+await checkAsync('a genuine manual stop is still never auto-resumed', async () => {
+  // The discriminator must not weaken the rule the user asked for twice. A stop
+  // clicked while online produces no offline evidence, and the classifier
+  // refuses it outright.
+  const { scheduler, clock, sent } = makeScheduler({ config: { autoResumeOnError: true } });
+  assert.equal(classifyInterrupt({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'user' } } } }), null);
+  scheduler.noteNetworkHint(false); // the browser is online: exactly the manual-stop case
+  assert.equal(scheduler.browserWasOffline(), false, 'online means no network excuse exists');
+  await new Promise((resolve) => setImmediate(resolve));
+  clock.advance(60000);
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 0);
+});
+
+await checkAsync('a graceful host shutdown is picked up after a restart', async () => {
+  // DSH closing (or a reboot) calls `AgentLoop.cancel({kind:'disposed'})`, which
+  // CLOSES the running turn — so the log looks closed and the old scan missed it.
+  const verdict = classifyRecovery([
+    { type: 'turn/start' },
+    { type: 'turn/end', data: { reason: { kind: 'aborted', reason: { kind: 'disposed' } } } },
+  ]);
+  assert.equal(verdict?.reason, 'host.exit', 'the shutdown fingerprint must be recognised');
+  const { scheduler, clock, sent } = makeScheduler({ config: { startupResume: true } });
+  scheduler.observeInterrupt('s1', 'host.exit', { recovered: true }, undefined);
+  await new Promise((resolve) => setImmediate(resolve));
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 1, 'and it resumes through the same gated path');
+});
+
+// ── the standing network monitor ────────────────────────────────────────────
+// Why this exists at all: "not connected" and "connected but the upstream is
+// unreachable" look identical from inside a dead turn, and neither emits a
+// dependable event. The old code only learned the link was back by running a
+// retry ladder that could stay in flight for ~2 minutes; the browser's "the link
+// is back" edge arrived during that window and was discarded, so the session sat
+// stopped forever. The monitor asks on a schedule instead, and the false→true
+// edge is what wakes waiting sessions.
+
+await checkAsync('the fast check starts every target in parallel, one attempt each', async () => {
+  const urls = ['https://a.test', 'https://b.test', 'https://c.test'];
+  const started = [];
+  // Deliberately never settles: if the implementation were sequential, the second
+  // target would never start at all and the count below would be 1.
+  const pending = probeReachable({
+    urls,
+    timeoutMs: 50,
+    fetchImpl: (url) => { started.push(url); return new Promise(() => {}); },
+  });
+  assert.equal(started.length, 3, 'all targets must be in flight at once');
+  assert.deepEqual(started, urls);
+  void pending;
+});
+
+await checkAsync('the fast check accepts any HTTP status as proof the wire works', async () => {
+  const result = await probeReachable({
+    urls: ['https://blocked.test', 'https://a.test'],
+    timeoutMs: 50,
+    fetchImpl: (url) => (url === 'https://blocked.test'
+      ? Promise.reject(new Error('getaddrinfo ENOTFOUND'))
+      : Promise.resolve({ status: 503 })),
+  });
+  assert.equal(result.ok, true, 'a 5xx still means something answered');
+  assert.equal(result.status, 503);
+  assert.equal(result.url, 'https://a.test');
+});
+
+await checkAsync('a slow target does not hold up the one that answers', async () => {
+  // Parallelism is not a style preference here: with a 400 ms timeout and three
+  // targets, a sequential probe would take a multiple of the timeout on EVERY
+  // check, and the timer would spend most of its life inside one.
+  const startedAt = Date.now();
+  const result = await probeReachable({
+    urls: ['https://slow.test', 'https://fast.test'],
+    timeoutMs: 400,
+    fetchImpl: (url) => (url === 'https://slow.test'
+      ? new Promise((_resolve, reject) => setTimeout(() => reject(new Error('timed out')), 300))
+      : new Promise((resolve) => setTimeout(() => resolve({ status: 200 }), 20))),
+  });
+  const elapsed = Date.now() - startedAt;
+  assert.equal(result.ok, true);
+  assert.equal(result.url, 'https://fast.test', 'the target that answers is the one that counts');
+  assert.ok(elapsed < 200, `the fast target must win without waiting for the slow one (took ${elapsed}ms)`);
+});
+
+await checkAsync('the fast check reports the underlying failure when nothing answers', async () => {
+  const result = await probeReachable({
+    urls: ['https://a.test', 'https://b.test'],
+    timeoutMs: 50,
+    fetchImpl: () => { throw new Error('getaddrinfo ENOTFOUND a.test'); },
+  });
+  assert.equal(result.ok, false);
+  assert.match(String(result.lastError?.message), /ENOTFOUND/);
+});
+
+await checkAsync('an unconfigured probe cannot wedge the feature shut', async () => {
+  // The probe is a GATE. If someone empties `probeUrls`, the safe reading is
+  // "no opinion", not "the internet is down forever".
+  const result = await probeReachable({ urls: [], timeoutMs: 50 });
+  assert.equal(result.ok, true);
+  assert.equal(result.skipped, true);
+});
+
+await checkAsync('the monitor resumes a waiting session when the link comes back', async () => {
+  const { scheduler, clock, sent } = makeScheduler();
+  // Control the wire directly rather than counting probe attempts: how many
+  // implicit checks a path performs is an implementation detail, but "the cable
+  // is out" must always produce the same verdict.
+  let wireUp = false;
+  scheduler.probe = async () => (wireUp
+    ? { ok: true, attempts: 1, ms: 3, url: 'https://probe.test' }
+    : { ok: false, attempts: 1, ms: 3, lastError: { message: 'no route to host' } });
+
+  scheduler.observeInterrupt('s1', 'network.stream', { message: 'fetch failed' }, 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  // `net.reachable` is null until something measures it, so `false` here also
+  // proves a transport-shaped interruption forced a fresh check.
+  assert.equal(scheduler.net.reachable, false, 'the monitor measured a down link');
+  assert.equal(scheduler.networkDown, true);
+  assert.equal(sent.length, 0, 'a dead link must not be sent into');
+  assert.match(String(scheduler.net.detail), /no route to host/, 'the monitor explains WHY it is down');
+
+  // The link comes back. That false→true edge is the whole feature.
+  wireUp = true;
+  await scheduler.checkNetwork('timer');
+  assert.equal(scheduler.net.reachable, true);
+  assert.equal(scheduler.networkDown, false);
+  assert.match(String(scheduler.net.via), /^probe:/, 'and it was a real probe, not a guess');
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 1, 'the false→true edge wakes the session');
+});
+
+await checkAsync('the monitor holds resumes when the link goes down', async () => {
+  const { scheduler, clock, sent } = makeScheduler();
+  let wireUp = true;
+  scheduler.probe = async () => ({ ok: wireUp, attempts: wireUp ? 1 : 3, ms: 4, lastError: wireUp ? null : { message: 'no route to host' } });
+  await scheduler.checkNetwork('timer');
+  assert.equal(scheduler.net.reachable, true, 'baseline: the link is up');
+  assert.equal(scheduler.net.detail, null, 'a healthy check has nothing to explain');
+
+  wireUp = false;
+  await scheduler.checkNetwork('timer');
+  assert.equal(scheduler.net.reachable, false);
+  assert.equal(scheduler.networkDown, true, 'resumes are held while the link is down');
+  assert.equal(scheduler.net.checks, 2);
+  assert.equal(scheduler.net.failures, 1);
+  assert.match(String(scheduler.net.detail), /no route to host/, 'the reason is kept for the log and the pill');
+
+  scheduler.observeInterrupt('s1', 'network.stream', { message: 'socket hang up' }, 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 0, 'a session interrupted while offline waits for the link');
+});
+
+await checkAsync('overlapping heartbeats share one check instead of stacking probes', async () => {
+  const { scheduler } = makeScheduler({ overrides: {} });
+  let inflight = 0;
+  let peak = 0;
+  scheduler.probe = () => {
+    inflight += 1;
+    peak = Math.max(peak, inflight);
+    return new Promise((resolve) => {
+      // The REAL timer: makeScheduler's clock captures timers instead of firing.
+      setTimeout(() => { inflight -= 1; resolve({ ok: true, attempts: 1, ms: 3 }); }, 10);
+    });
+  };
+  const [a, b] = await Promise.all([scheduler.checkNetwork('tick'), scheduler.checkNetwork('session')]);
+  assert.equal(peak, 1, 'the second caller must JOIN the in-flight check, not start another');
+  assert.equal(a, b, 'and both must see the same verdict');
+  assert.equal(scheduler.net.checks, 1, 'one probe, one measurement');
+});
+
+await checkAsync('a completed turn proves the link works even when the probe cannot', async () => {
+  // On this machine the user's traffic goes through a TLS-terminating accelerator
+  // with its own CA, so a plain fetch to the probe targets can fail certificate
+  // validation while real model traffic is fine. Without a witness the probe's
+  // verdict would stick at "offline" and the plugin would never resume — the same
+  // reported symptom, arrived at from the other direction.
+  const { scheduler, clock, sent } = makeScheduler();
+  scheduler.probe = async () => ({ ok: false, attempts: 1, ms: 3, lastError: { message: 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' } });
+  await scheduler.checkNetwork('timer');
+  assert.equal(scheduler.net.reachable, false, 'the blocked probe says down');
+  assert.match(String(scheduler.net.detail), /LEAF_SIGNATURE/, 'and it says why: the proxy certificate, not the wire');
+  scheduler.observeInterrupt('s1', 'network.stream', { message: 'fetch failed' }, 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sent.length, 0, 'so with the probe as the only evidence, nothing is sent');
+
+  scheduler.noteReachabilityWitness('turn/end');
+  assert.equal(scheduler.net.reachable, true, 'a completed turn overrides the blocked probe');
+  assert.equal(scheduler.networkDown, false);
+  assert.match(String(scheduler.net.via), /witness/);
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 1, 'and the session continues');
+});
+
+await checkAsync('a transport failure outranks a check that answered a second earlier', async () => {
+  // The monitor refreshes `lastProbe` every 10 s, which would otherwise let a
+  // "reachable" measurement taken moments before the drop authorise an instant
+  // send straight back into the dead link — burning the auto budget on retries
+  // that cannot work. A transport-shaped interruption must force a fresh check.
+  const { scheduler, clock, sent, probes } = makeScheduler();
+  await scheduler.checkNetwork('timer');
+  assert.equal(scheduler.net.reachable, true, 'baseline: a fresh success is on record');
+  const before = probes.length;
+
+  scheduler.observeInterrupt('s1', 'network.stream', { message: 'socket hang up' }, 1);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(sent.length, 0, 'the stale success must not authorise an instant send');
+
+  await fireArmed(clock, scheduler);
+  assert.equal(sent.length, 1, 'it does send once a fresh check passes');
+  assert.ok(probes.length > before, 'and that send was gated on a NEW check');
 });
 
 // ── report ──────────────────────────────────────────────────────────────────

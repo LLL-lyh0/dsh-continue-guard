@@ -548,6 +548,28 @@ await check('routes are document-relative', async () => {
   }
 });
 
+await check('a page loaded while already offline reports that state on mount', async () => {
+  // A WiFi drop that happened BEFORE the page loaded fires no `offline` event —
+  // there is no edge to observe. Without this report the host never learns the
+  // machine is offline, so the evidence it uses to tell a link failure from a
+  // model error would be missing for exactly the sessions that need it.
+  const { requests } = await render(IDLE, { online: false });
+  const reported = requests.filter((r) => r.url.includes('/network'));
+  assert.ok(reported.length >= 1, `no network report on mount; saw ${requests.map((r) => r.url).join(', ')}`);
+  assert.equal(JSON.parse(reported[0].init.body).down, true, 'the standing offline state must be reported as down');
+  // An ONLINE page must stay quiet: reporting "down" when nothing is wrong would
+  // manufacture evidence and weaken the discriminator.
+  const online = await render(IDLE, { online: true });
+  assert.equal(online.requests.filter((r) => r.url.includes('/network')).length, 0,
+    'an online page must not report a phantom offline state');
+});
+
+await check('the browser edges are still forwarded after mount', async () => {
+  const { listeners } = await render(IDLE, { online: true });
+  assert.ok(Array.isArray(listeners.offline) && listeners.offline.length > 0, 'no offline listener registered');
+  assert.ok(Array.isArray(listeners.online) && listeners.online.length > 0, 'no online listener registered');
+});
+
 console.log(`\n${failures.length === 0 ? 'All' : `${failures.length} FAILED,`} ${passed} client checks ${failures.length === 0 ? 'passed' : ''}.\n`);
 if (failures.length > 0) {
   for (const failure of failures) console.error(`  ✗ ${failure}\n`);

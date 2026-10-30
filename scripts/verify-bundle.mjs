@@ -313,6 +313,30 @@ check('the host exports an apply function', () => {
   if (typeof host.apply !== 'function') throw new Error('no apply export');
 });
 
+check('the host calls the agents service the way the service is actually shaped', () => {
+  // `ctx.agents` is the AgentRegistry FACADE, not AgentLoop. The facade's
+  // `resume(options)` takes ONE argument and supplies `ownerCtx = this.ctx`
+  // itself (`dsh-agent/lib/index.js:467` — `Reflect.apply(target.resume,
+  // receiver, [ownerCtx, options])`); the two-argument `resume(ownerCtx, options)`
+  // is the loop's own method and is NOT reachable from a plugin. Pass a context
+  // first and the CONTEXT becomes `options`, `options.resumeSessionId` is
+  // undefined, and the resume dies on a schema check before it opens the log —
+  // a silent no-op that shipped once and survived every gate. This check is
+  // static on purpose: the behavioural gate in verify-mount needs a fake shaped
+  // like the real service, and this one still catches the call site if that fake
+  // ever drifts back to being permissive.
+  // Scan CODE, not prose: the caller above documents the two `resume` shapes in
+  // a comment, and a naive scan matches that text instead of the call site. This
+  // is the same comment-anchor trap that produced a false failure once already.
+  const src = code(read('index.js'));
+  const calls = [...src.matchAll(/agents\.resume\(([^)]*)/g)].map((m) => m[1].trim());
+  if (calls.length === 0) throw new Error('agents.resume is never called — recovery has no way to wake a session');
+  for (const args of calls) {
+    if (!args.startsWith('{')) throw new Error(`agents.resume(...) takes exactly one options object; saw resume(${args}`);
+  }
+  return `${calls.length} call(s), all one-argument`;
+});
+
 check('the host does not import harness packages at module scope', () => {
   // A link:-installed bundle resolves from the workspace, which has no
   // node_modules/@deepseek-ai; a bare import there throws ERR_MODULE_NOT_FOUND
